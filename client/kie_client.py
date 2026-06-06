@@ -1,6 +1,6 @@
 """HTTP client for Kie.ai.
 
-Kie.ai exposes TWO different endpoint patterns:
+Kie.ai exposes THREE different endpoint patterns:
 
 1. **Market generic** (Seedance, Kling, Hailuo, Wan, ElevenLabs, Claude, etc):
 
@@ -18,8 +18,22 @@ Kie.ai exposes TWO different endpoint patterns:
    - Status lives in ``data.successFlag`` (0=generating, 1=success, 2/3=failed)
    - Result URLs live in ``data.response.resultUrls`` (array, NOT a JSON string)
 
-This client exposes two pairs of methods, one per pattern, plus convenience
-``run_market`` / ``run_veo`` wrappers that hide the polling details.
+3. **Runway dedicated** (Runway Gen-4 + Aleph):
+
+   - POST /api/v1/runway/generate  with { prompt, imageUrl, quality, ... }
+     POST /api/v1/runway/extend    with { taskId, prompt, quality, ... }
+     POST /api/v1/aleph/generate   with { prompt, videoUrl, waterMark, ... }
+     (parameters use camelCase and are NOT wrapped in an ``input`` key)
+   - GET  /api/v1/runway/record-detail?taskId=X
+   - Status lives in ``data.state`` (wait/success/fail)
+   - Result URL lives in ``data.videoInfo.videoUrl``
+
+This client exposes method pairs per pattern, plus convenience
+``run_market`` / ``run_veo`` / ``run_runway`` wrappers that hide the
+polling details.
+
+For the Gemini Omni helper endpoints (audio/character creation), see
+``create_omni_resource`` — these are synchronous and return immediately.
 """
 
 from __future__ import annotations
@@ -52,8 +66,13 @@ _VEO_FLAG_SUCCESS = 1
 _VEO_FLAG_FAILED = 2
 _VEO_FLAG_GEN_FAILED = 3
 
+# Runway endpoint state values (text strings, like Market).
+_RUNWAY_STATE_COMPLETED = {"success"}
+_RUNWAY_STATE_FAILED = {"fail"}
+
 # Inner ``code`` values that mean SUCCESS at the API level.
-_OK_CODES = {200}
+# Note: omni/audio/create uses 0 for success (not 200).
+_OK_CODES = {0, 200}
 
 # Polling defaults.
 _DEFAULT_POLL_INTERVAL_SECONDS = 3.0
@@ -64,7 +83,8 @@ _DEFAULT_REQUEST_TIMEOUT_SECONDS = 30.0
 class KieClient:
     """Thin HTTP client around the Kie.ai REST API.
 
-    Supports both the Market generic endpoints and the Veo dedicated endpoints.
+    Supports Market generic, Veo dedicated, Runway dedicated, and Omni
+    resource-creation endpoints.
     """
 
     def __init__(
@@ -81,7 +101,7 @@ class KieClient:
             headers={
                 "Authorization": f"Bearer {self._api_key}",
                 "Content-Type": "application/json",
-                "User-Agent": "comfyui-genesis-kie/0.1.0",
+                "User-Agent": "comfyui-genesis-kie/0.3.0",
             },
         )
 
@@ -192,11 +212,7 @@ class KieClient:
         timeout: float = _DEFAULT_TIMEOUT_SECONDS,
         progress_callback: Any = None,
     ) -> dict[str, Any]:
-        """Poll a market task until success/fail/timeout.
-
-        Returns the ``data`` dict with ``_parsed_result`` (the parsed
-        ``resultJson``) merged in.
-        """
+        """Poll a market task until success/fail/timeout."""
         deadline = time.monotonic() + timeout
         attempts = 0
 
@@ -214,8 +230,8 @@ class KieClient:
             if state in _MARKET_STATE_COMPLETED:
                 data["_parsed_result"] = self._parse_result_json(data)
                 log.info(
-                    "Kie market task succeeded taskId=%s attempts=%d cost_time=%sms",
-                    task_id, attempts, data.get("costTime"),
+                    "Kie market task succeeded taskId=%s attempts=%d",
+                    task_id, attempts,
                 )
                 return data
 
@@ -271,21 +287,7 @@ class KieClient:
         callback_url: str | None = None,
         seeds: int | None = None,
     ) -> str:
-        """Create a Veo 3.1 task using the dedicated API.
-
-        Args:
-            prompt: Required text prompt.
-            model: One of ``"veo3"``, ``"veo3_fast"``, ``"veo3_lite"``.
-            image_urls: Optional list of 1-2 image URLs (for image-to-video).
-            aspect_ratio: ``"16:9"``, ``"9:16"``, or ``"Auto"``.
-            resolution: ``"720p"``, ``"1080p"``, or ``"4k"``.
-            generation_type: ``"TEXT_2_VIDEO"``, ``"FIRST_AND_LAST_FRAMES_2_VIDEO"``,
-                or ``"REFERENCE_2_VIDEO"``. Auto-detected if omitted.
-            enable_translation: Translate prompt to English (default True).
-            watermark: Optional watermark text.
-            callback_url: Optional webhook URL.
-            seeds: Optional seed for reproducibility.
-        """
+        """Create a Veo 3.1 task using the dedicated API."""
         body: dict[str, Any] = {
             "prompt": prompt,
             "model": model,
@@ -408,6 +410,176 @@ class KieClient:
             progress_callback=progress_callback,
         )
 
+    # ============================================== RUNWAY PATTERN (dedicated)
+
+    def create_runway_task(
+        self,
+        path: str,
+        body: dict[str, Any],
+    ) -> str:
+        """Create a Runway-family task.
+
+        Args:
+            path: One of "/api/v1/runway/generate", "/api/v1/runway/extend",
+                  "/api/v1/aleph/generate".
+            body: Pre-built request body (camelCase keys, no ``input`` wrapper).
+
+        Note: Runway endpoints use camelCase keys directly at the top
+        level (imageUrl, aspectRatio, waterMark, callBackUrl) — NOT
+        wrapped in an ``input`` key like Market endpoints.
+        """
+        log.debug("Kie createRunwayTask path=%s", path)
+        payload = self._request("POST", path, json=body)
+        data = payload.get("data") or {}
+        task_id = data.get("taskId") or data.get("task_id")
+        if not task_id:
+            raise KieError(
+                f"Kie.ai response did not include a taskId: {payload}"
+            )
+        log.info("Kie runway task created path=%s taskId=%s", path, task_id)
+        return task_id
+
+    def get_runway_task(self, task_id: str) -> dict[str, Any]:
+        """Fetch a Runway task's current state.
+
+        Uses the same record-detail endpoint regardless of whether the task
+        was generate/extend/aleph.
+        """
+        payload = self._request(
+            "GET",
+            "/api/v1/runway/record-detail",
+            params={"taskId": task_id},
+        )
+        return payload.get("data") or {}
+
+    def wait_for_runway_task(
+        self,
+        task_id: str,
+        *,
+        poll_interval: float = _DEFAULT_POLL_INTERVAL_SECONDS,
+        timeout: float = _DEFAULT_TIMEOUT_SECONDS,
+        progress_callback: Any = None,
+    ) -> dict[str, Any]:
+        """Poll a Runway task until completion.
+
+        State values: "wait" / "success" / "fail".
+        Result URL: ``data.videoInfo.videoUrl``.
+        """
+        deadline = time.monotonic() + timeout
+        attempts = 0
+
+        while True:
+            attempts += 1
+            data = self.get_runway_task(task_id)
+            state = (data.get("state") or "").lower()
+
+            if progress_callback is not None:
+                try:
+                    progress_callback(data)
+                except Exception:  # noqa: BLE001
+                    log.debug("Progress callback raised; ignoring", exc_info=True)
+
+            if state in _RUNWAY_STATE_COMPLETED:
+                log.info(
+                    "Kie runway task succeeded taskId=%s attempts=%d",
+                    task_id, attempts,
+                )
+                return data
+
+            if state in _RUNWAY_STATE_FAILED:
+                err_code = data.get("failCode") or ""
+                err_msg = (
+                    data.get("failMsg")
+                    or data.get("msg")
+                    or f"Runway task failed (state={state})"
+                )
+                err = f"{err_msg} (failCode={err_code})" if err_code else err_msg
+                raise KieTaskFailedError(err, task_id=task_id)
+
+            if time.monotonic() >= deadline:
+                raise KieTimeoutError(
+                    f"Runway task {task_id} did not complete within {timeout:.0f}s "
+                    f"(last state={state!r})"
+                )
+
+            time.sleep(poll_interval)
+
+    def run_runway(
+        self,
+        path: str,
+        body: dict[str, Any],
+        *,
+        poll_interval: float = 5.0,
+        timeout: float = 900.0,
+        progress_callback: Any = None,
+    ) -> dict[str, Any]:
+        """Convenience: create + poll a Runway task."""
+        task_id = self.create_runway_task(path, body)
+        return self.wait_for_runway_task(
+            task_id,
+            poll_interval=poll_interval,
+            timeout=timeout,
+            progress_callback=progress_callback,
+        )
+
+    # =============================================== OMNI RESOURCE ENDPOINTS
+
+    def create_omni_audio(
+        self,
+        *,
+        audio_id: str,
+        name: str,
+        voice_description: str,
+        example_dialogue: str = "",
+    ) -> dict[str, Any]:
+        """Create a Gemini Omni reusable voice (synchronous).
+
+        Returns the response ``data`` dict, including ``kieAudioId`` to
+        reference later in Gemini Omni Video calls.
+        """
+        body = {
+            "audio_id": audio_id,
+            "name": name,
+            "voice_description": voice_description,
+        }
+        if example_dialogue:
+            body["example_dialogue"] = example_dialogue
+
+        log.debug("Kie create omni audio audio_id=%s", audio_id)
+        payload = self._request("POST", "/api/v1/omni/audio/create", json=body)
+        return payload.get("data") or {}
+
+    def create_omni_character(
+        self,
+        *,
+        character_id: str,
+        name: str,
+        character_description: str,
+        image_urls: list[str],
+    ) -> dict[str, Any]:
+        """Create a Gemini Omni reusable character (synchronous).
+
+        Returns the response ``data`` dict, including the kieCharacterId
+        to reference later in Gemini Omni Video calls.
+
+        Note: The exact endpoint shape was inferred from the audio
+        endpoint pattern. If Kie's character endpoint differs, adjust
+        the path or body shape here.
+        """
+        body = {
+            "character_id": character_id,
+            "name": name,
+            "character_description": character_description,
+            "image_urls": image_urls,
+        }
+        log.debug("Kie create omni character character_id=%s", character_id)
+        payload = self._request(
+            "POST",
+            "/api/v1/omni/character/create",
+            json=body,
+        )
+        return payload.get("data") or {}
+
     # ------------------------------------------------------------- helpers
 
     @staticmethod
@@ -445,7 +617,6 @@ class KieClient:
                 return int(credits) if credits is not None else None
             except (TypeError, ValueError):
                 return None
-        # Sometimes the endpoint returns the number directly
         try:
             return int(data) if data is not None else None
         except (TypeError, ValueError):
