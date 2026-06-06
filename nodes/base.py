@@ -1,13 +1,25 @@
 """Base classes for all Genesis-Kie ComfyUI nodes.
 
-The intent: each concrete node should only need to declare:
+Two distinct base classes for video models, matching Kie.ai's two endpoint
+patterns:
 
-- The Kie ``model`` identifier
+- :class:`BaseKieMarketVideoNode` — for Seedance, Kling, Hailuo, Wan,
+  HappyHorse, Grok, ElevenLabs, etc. Uses ``/api/v1/jobs/createTask`` and
+  ``/api/v1/jobs/recordInfo``.
+
+- :class:`BaseKieVeoVideoNode` — for Veo 3.1 only. Uses
+  ``/api/v1/veo/generate`` and ``/api/v1/veo/record-info`` with a different
+  response shape.
+
+Subclasses only declare:
+
+- The Kie ``MODEL`` identifier
 - The ComfyUI ``INPUT_TYPES`` shape
-- How to map ComfyUI inputs to the Kie ``input`` dict
-- Where the result URL lives in the Kie ``data`` dict
+- ``build_input(**kwargs)`` to map ComfyUI inputs → Kie input dict
+- (Rarely) override ``extract_output`` for unusual response shapes
 
-Everything else (HTTP, polling, downloading, error mapping) is handled here.
+Everything else (HTTP, polling, JSON parsing, downloading, error mapping) is
+handled here.
 """
 
 from __future__ import annotations
@@ -26,72 +38,127 @@ from ..client import (
 log = logging.getLogger("genesis_kie")
 
 
-# Category strings shown in the ComfyUI menu. Keeping them short and grouped
-# under a single "GenesisKie" prefix so users can find them easily.
+# Category strings shown in the ComfyUI menu.
 CATEGORY_VIDEO = "GenesisKie/Video"
 CATEGORY_IMAGE = "GenesisKie/Image"
 CATEGORY_MUSIC = "GenesisKie/Music"
 CATEGORY_LLM = "GenesisKie/LLM"
 
 
+# ----------------------------------------------------------------- common base
+
 class BaseKieNode:
-    """Common scaffolding for any node that talks to Kie.ai.
+    """Common ComfyUI plumbing for any Kie-backed node.
 
-    Subclasses must define:
-
-    - ``MODEL_ID``: str — Kie.ai model identifier (e.g. ``"google/veo-3.1-fast"``).
-    - ``INPUT_TYPES``: classmethod returning the ComfyUI input schema.
-    - ``RETURN_TYPES``: tuple of output type names.
-    - ``FUNCTION``: name of the method to call (typically ``"run"``).
-    - ``build_input(...)``: instance method that maps ComfyUI inputs to the
-      Kie ``input`` dict.
-    - ``extract_output(data: dict)``: instance method that turns the Kie
-      result into the ComfyUI return tuple.
+    Concrete subclasses (or modality-specific bases like
+    :class:`BaseKieMarketVideoNode`) take care of HTTP + parsing.
     """
 
-    # Subclasses MUST override these.
-    MODEL_ID: ClassVar[str] = ""
+    MODEL: ClassVar[str] = ""
     CATEGORY: ClassVar[str] = "GenesisKie"
     RETURN_TYPES: ClassVar[tuple[str, ...]] = ()
     RETURN_NAMES: ClassVar[tuple[str, ...]] = ()
     FUNCTION: ClassVar[str] = "run"
 
-    # Polling defaults — subclasses may override (video tends to take longer).
+    # Polling defaults — subclasses may override per-model.
     POLL_INTERVAL_SECONDS: ClassVar[float] = 3.0
     TIMEOUT_SECONDS: ClassVar[float] = 600.0
 
-    # ---------------------------------------------------------- subclass API
-
     def build_input(self, **kwargs: Any) -> dict[str, Any]:
-        """Translate the ComfyUI inputs into the Kie ``input`` dict.
+        """Translate ComfyUI inputs into the Kie ``input`` dict.
 
-        Default implementation passes everything straight through. Override
+        Default implementation drops ``None`` and empty strings. Override
         when you need to rename keys, coerce types, or drop empty values.
         """
         return {k: v for k, v in kwargs.items() if v not in (None, "")}
 
     def extract_output(self, data: dict[str, Any]) -> tuple[Any, ...]:
-        """Turn the Kie ``data`` dict into the ComfyUI return tuple.
-
-        Must be overridden by concrete subclasses.
-        """
+        """Turn the Kie ``data`` dict into the ComfyUI return tuple."""
         raise NotImplementedError
 
-    # ---------------------------------------------------------- ComfyUI hook
 
-    def run(self, **kwargs: Any) -> tuple[Any, ...]:
-        if not self.MODEL_ID:
-            raise KieError(
-                f"{type(self).__name__} did not declare MODEL_ID."
-            )
+# ================================================== MARKET (jobs/createTask)
+
+class BaseKieMarketVideoNode(BaseKieNode):
+    """Base class for video nodes that use the Market generic endpoint.
+
+    Covers: Seedance, Kling (except Avatar/motion-control may extend),
+    Hailuo, Wan, HappyHorse, Grok Imagine, Runway, etc.
+
+    Subclasses MUST set ``MODEL`` and define ``INPUT_TYPES``. They typically
+    override ``build_input`` to translate ComfyUI inputs to the model's
+    specific ``input`` schema.
+    """
+
+    CATEGORY = CATEGORY_VIDEO
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("video_path",)
+
+    # Video usually takes longer than image. 15 min upper bound.
+    TIMEOUT_SECONDS = 900.0
+    POLL_INTERVAL_SECONDS = 5.0
+
+    def run(self, **kwargs: Any) -> tuple[str, ...]:
+        if not self.MODEL:
+            raise KieError(f"{type(self).__name__} did not declare MODEL.")
 
         inputs = self.build_input(**kwargs)
-        log.debug("Kie node=%s model=%s inputs=%s",
-                  type(self).__name__, self.MODEL_ID, inputs)
+        log.debug(
+            "Kie market video node=%s model=%s inputs=%s",
+            type(self).__name__, self.MODEL, inputs,
+        )
 
         with KieClient() as client:
-            data = client.run(
-                self.MODEL_ID,
+            last_state = [None]
+
+            def on_progress(d: dict[str, Any]) -> None:
+                state = d.get("state")
+                if state != last_state[0]:
+                    log.info("Kie task state=%s", state)
+                    last_state[0] = state
+
+            data = client.run_market(
+                self.MODEL,
+                inputs,
+                poll_interval=self.POLL_INTERVAL_SECONDS,
+                timeout=self.TIMEOUT_SECONDS,
+                progress_callback=on_progress,
+            )
+
+        return self.extract_output(data)
+
+    def extract_output(self, data: dict[str, Any]) -> tuple[str, ...]:
+        url = first_url(data)
+        if not url:
+            parsed = data.get("_parsed_result") or {}
+            raise KieError(
+                "Kie returned no video URL. "
+                f"_parsed_result keys: "
+                f"{list(parsed.keys()) if isinstance(parsed, dict) else 'n/a'}, "
+                f"data keys: {list(data.keys())}"
+            )
+        path = download_to_output(url, prefix="kie_video", fallback_ext="mp4")
+        return (path,)
+
+
+class BaseKieMarketImageNode(BaseKieNode):
+    """Base for image nodes using the Market endpoint."""
+
+    CATEGORY = CATEGORY_IMAGE
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+
+    TIMEOUT_SECONDS = 300.0
+    POLL_INTERVAL_SECONDS = 2.0
+
+    def run(self, **kwargs: Any) -> tuple[Any, ...]:
+        if not self.MODEL:
+            raise KieError(f"{type(self).__name__} did not declare MODEL.")
+
+        inputs = self.build_input(**kwargs)
+        with KieClient() as client:
+            data = client.run_market(
+                self.MODEL,
                 inputs,
                 poll_interval=self.POLL_INTERVAL_SECONDS,
                 timeout=self.TIMEOUT_SECONDS,
@@ -99,132 +166,174 @@ class BaseKieNode:
 
         return self.extract_output(data)
 
+    def extract_output(self, data: dict[str, Any]) -> tuple[Any, ...]:
+        url = first_url(data)
+        if not url:
+            parsed = data.get("_parsed_result") or {}
+            raise KieError(
+                "Kie returned no image URL. "
+                f"_parsed_result keys: "
+                f"{list(parsed.keys()) if isinstance(parsed, dict) else 'n/a'}, "
+                f"data keys: {list(data.keys())}"
+            )
+        tensor = image_url_to_tensor(url)
+        return (tensor,)
 
-class BaseKieVideoNode(BaseKieNode):
-    """Base class for video-generation nodes.
 
-    Returns a single output: the absolute path to the downloaded video file
-    in ComfyUI's output dir. Most video models in Kie return ``video_url``
-    or ``output.video_url``.
+class BaseKieMarketAudioNode(BaseKieNode):
+    """Base for audio/music nodes using the Market endpoint."""
+
+    CATEGORY = CATEGORY_MUSIC
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("audio_path",)
+
+    TIMEOUT_SECONDS = 600.0
+    POLL_INTERVAL_SECONDS = 3.0
+
+    def run(self, **kwargs: Any) -> tuple[str, ...]:
+        if not self.MODEL:
+            raise KieError(f"{type(self).__name__} did not declare MODEL.")
+        inputs = self.build_input(**kwargs)
+        with KieClient() as client:
+            data = client.run_market(
+                self.MODEL,
+                inputs,
+                poll_interval=self.POLL_INTERVAL_SECONDS,
+                timeout=self.TIMEOUT_SECONDS,
+            )
+        return self.extract_output(data)
+
+    def extract_output(self, data: dict[str, Any]) -> tuple[str, ...]:
+        url = first_url(data)
+        if not url:
+            raise KieError(
+                f"Kie returned no audio URL. data keys: {list(data.keys())}"
+            )
+        path = download_to_output(url, prefix="kie_audio", fallback_ext="mp3")
+        return (path,)
+
+
+class BaseKieMarketTextNode(BaseKieNode):
+    """Base for chat/LLM nodes using the Market endpoint."""
+
+    CATEGORY = CATEGORY_LLM
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("text",)
+
+    TIMEOUT_SECONDS = 180.0
+    POLL_INTERVAL_SECONDS = 1.0
+
+    def run(self, **kwargs: Any) -> tuple[str, ...]:
+        if not self.MODEL:
+            raise KieError(f"{type(self).__name__} did not declare MODEL.")
+        inputs = self.build_input(**kwargs)
+        with KieClient() as client:
+            data = client.run_market(
+                self.MODEL,
+                inputs,
+                poll_interval=self.POLL_INTERVAL_SECONDS,
+                timeout=self.TIMEOUT_SECONDS,
+            )
+        return self.extract_output(data)
+
+    def extract_output(self, data: dict[str, Any]) -> tuple[str, ...]:
+        parsed = data.get("_parsed_result") or {}
+        if isinstance(parsed, dict):
+            obj = parsed.get("resultObject") or parsed
+            if isinstance(obj, dict):
+                # Common shapes: {"content": "..."}, {"text": "..."},
+                # OpenAI-style {"choices": [{"message": {"content": "..."}}]}
+                for key in ("content", "text", "message", "output"):
+                    val = obj.get(key)
+                    if isinstance(val, str) and val:
+                        return (val,)
+                    if isinstance(val, dict):
+                        sub = val.get("content") or val.get("text")
+                        if isinstance(sub, str) and sub:
+                            return (sub,)
+                choices = obj.get("choices")
+                if isinstance(choices, list) and choices:
+                    msg = choices[0].get("message") if isinstance(choices[0], dict) else None
+                    if isinstance(msg, dict):
+                        content = msg.get("content")
+                        if isinstance(content, str):
+                            return (content,)
+            if isinstance(obj, str):
+                return (obj,)
+
+        raise KieError(
+            f"Kie returned no text content. "
+            f"_parsed_result keys: "
+            f"{list(parsed.keys()) if isinstance(parsed, dict) else 'n/a'}, "
+            f"data keys: {list(data.keys())}"
+        )
+
+
+# ======================================================= VEO (dedicated API)
+
+class BaseKieVeoVideoNode(BaseKieNode):
+    """Base class for Veo 3.1 video nodes (dedicated endpoint).
+
+    The Veo API has a different shape than the Market API:
+    - Request goes to ``/api/v1/veo/generate`` with parameters at the top
+      level (NOT wrapped in ``input``).
+    - Status uses ``successFlag`` (0/1/2/3) instead of ``state``.
+    - URLs live at ``data.response.resultUrls`` (a real array, not a
+      JSON string).
     """
 
     CATEGORY = CATEGORY_VIDEO
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("video_path",)
 
-    # Keys to check for the result URL, in priority order.
-    URL_KEYS: ClassVar[list[str]] = [
-        "video_url",
-        "videoUrl",
-        "video",
-        "output_video_url",
-        "url",
-        "output",
-        "result",
-    ]
-
-    # Wait up to 15 minutes for video by default — some models (Veo Quality
-    # 4K, Sora Pro) routinely take 5-10 min.
     TIMEOUT_SECONDS = 900.0
     POLL_INTERVAL_SECONDS = 5.0
 
-    def extract_output(self, data: dict[str, Any]) -> tuple[Any, ...]:
-        url = first_url(data, self.URL_KEYS)
-        if not url:
-            raise KieError(
-                f"Kie returned no video URL. Keys in data: {list(data.keys())}"
+    def build_veo_request(self, **kwargs: Any) -> dict[str, Any]:
+        """Translate ComfyUI inputs into kwargs for ``client.run_veo()``.
+
+        Override to customize per-tier behavior. The default expects ComfyUI
+        kwargs that match ``run_veo``'s parameters directly.
+        """
+        return kwargs
+
+    def run(self, **kwargs: Any) -> tuple[str, ...]:
+        if not self.MODEL:
+            raise KieError(f"{type(self).__name__} did not declare MODEL.")
+
+        veo_kwargs = self.build_veo_request(**kwargs)
+        veo_kwargs.setdefault("model", self.MODEL)
+
+        with KieClient() as client:
+            last_flag = [None]
+
+            def on_progress(d: dict[str, Any]) -> None:
+                flag = d.get("successFlag")
+                if flag != last_flag[0]:
+                    log.info("Veo successFlag=%s", flag)
+                    last_flag[0] = flag
+
+            data = client.run_veo(
+                poll_interval=self.POLL_INTERVAL_SECONDS,
+                timeout=self.TIMEOUT_SECONDS,
+                progress_callback=on_progress,
+                **veo_kwargs,
             )
-        path = download_to_output(url, prefix="kie_video", fallback_ext="mp4")
+
+        return self.extract_output(data)
+
+    def extract_output(self, data: dict[str, Any]) -> tuple[str, ...]:
+        response = data.get("response") or {}
+        urls = response.get("resultUrls") or []
+        if not urls or not isinstance(urls, list):
+            raise KieError(
+                "Veo response did not include resultUrls. "
+                f"response keys: {list(response.keys())}, "
+                f"data keys: {list(data.keys())}"
+            )
+        video_url = urls[0]
+        if not isinstance(video_url, str) or not video_url:
+            raise KieError(f"Empty video URL in resultUrls: {urls}")
+        log.info("Veo video URL: %s", video_url)
+        path = download_to_output(video_url, prefix="kie_veo", fallback_ext="mp4")
         return (path,)
-
-
-class BaseKieImageNode(BaseKieNode):
-    """Base class for image-generation nodes.
-
-    Returns a single ComfyUI ``IMAGE`` tensor (BHWC float32 in [0, 1]).
-    """
-
-    CATEGORY = CATEGORY_IMAGE
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("image",)
-
-    URL_KEYS: ClassVar[list[str]] = [
-        "image_url",
-        "imageUrl",
-        "image",
-        "output_image_url",
-        "url",
-        "images",
-        "output",
-        "result",
-    ]
-
-    TIMEOUT_SECONDS = 300.0
-    POLL_INTERVAL_SECONDS = 2.0
-
-    def extract_output(self, data: dict[str, Any]) -> tuple[Any, ...]:
-        url = first_url(data, self.URL_KEYS)
-        if not url:
-            raise KieError(
-                f"Kie returned no image URL. Keys in data: {list(data.keys())}"
-            )
-        tensor = image_url_to_tensor(url)
-        return (tensor,)
-
-
-class BaseKieAudioNode(BaseKieNode):
-    """Base class for audio / music generation nodes.
-
-    Returns the absolute path to the downloaded audio file.
-    """
-
-    CATEGORY = CATEGORY_MUSIC
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("audio_path",)
-
-    URL_KEYS: ClassVar[list[str]] = [
-        "audio_url",
-        "audioUrl",
-        "audio",
-        "music_url",
-        "url",
-        "output",
-        "result",
-    ]
-
-    TIMEOUT_SECONDS = 600.0
-    POLL_INTERVAL_SECONDS = 3.0
-
-    def extract_output(self, data: dict[str, Any]) -> tuple[Any, ...]:
-        url = first_url(data, self.URL_KEYS)
-        if not url:
-            raise KieError(
-                f"Kie returned no audio URL. Keys in data: {list(data.keys())}"
-            )
-        path = download_to_output(url, prefix="kie_audio", fallback_ext="mp3")
-        return (path,)
-
-
-class BaseKieTextNode(BaseKieNode):
-    """Base class for chat / LLM nodes.
-
-    Returns the assistant's text response.
-    """
-
-    CATEGORY = CATEGORY_LLM
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("text",)
-
-    TIMEOUT_SECONDS = 120.0
-    POLL_INTERVAL_SECONDS = 1.0
-
-    def extract_output(self, data: dict[str, Any]) -> tuple[Any, ...]:
-        # LLM endpoints typically return text under ``content`` or ``output``.
-        text = data.get("content") or data.get("output") or data.get("text")
-        if isinstance(text, dict):
-            text = text.get("text") or text.get("content")
-        if not isinstance(text, str):
-            raise KieError(
-                f"Kie returned no text content. Keys in data: {list(data.keys())}"
-            )
-        return (text,)

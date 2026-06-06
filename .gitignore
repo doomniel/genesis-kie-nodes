@@ -41,3 +41,9 @@ Thumbs.db
 .env
 .env.local
 *.log
+
+# Local tests with real API key
+tests_local/
+
+# Generated videos / images / audio
+output/

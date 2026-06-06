@@ -1,13 +1,19 @@
 """Veo 3.1 video generation nodes.
 
-Three tiers are exposed, all under Kie.ai's ``google/`` namespace:
+Veo 3.1 in Kie.ai uses a DEDICATED API (not the generic Market endpoint).
+The model identifiers are:
 
-- ``google/veo-3.1-lite``     → cheapest, no audio in some configs
-- ``google/veo-3.1-fast``     → balanced quality / cost
-- ``google/veo-3.1-quality``  → top tier, 4K + audio
+- ``veo3``       → Quality (top tier)
+- ``veo3_fast``  → Fast (balanced)
+- ``veo3_lite``  → Lite (cheapest)
+
+Endpoints used:
+- POST /api/v1/veo/generate
+- GET  /api/v1/veo/record-info?taskId=X
 
 Pricing reference (Kie.ai, 2026):
     Lite 720p / 8s audio       $0.15  /video
+    Lite 1080p / 8s audio      $0.175 /video
     Fast 720p / 8s audio       $0.30  /video
     Fast 4K / 8s audio         $0.90  /video
     Quality 1080p / 8s audio   $1.275 /video
@@ -16,20 +22,19 @@ Pricing reference (Kie.ai, 2026):
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, ClassVar
 
-from ..base import BaseKieVideoNode
+from ..base import BaseKieVeoVideoNode
 
 
-# Resolutions accepted by all three tiers. Not every tier supports every
-# resolution; Kie will reject invalid combos with a clear error.
 _RESOLUTIONS = ["720p", "1080p", "4k"]
-_ASPECT_RATIOS = ["16:9", "9:16", "1:1"]
-_DURATIONS = [4, 6, 8]  # seconds; Veo defaults to 8
+_ASPECT_RATIOS = ["16:9", "9:16", "Auto"]
 
 
-class _Veo31Base(BaseKieVideoNode):
-    """Shared INPUT_TYPES and input mapping for all Veo 3.1 tiers."""
+class _Veo31Base(BaseKieVeoVideoNode):
+    """Shared INPUT_TYPES + build_veo_request for all Veo 3.1 tiers."""
+
+    MODEL: ClassVar[str] = ""  # subclasses set this
 
     @classmethod
     def INPUT_TYPES(cls) -> dict[str, Any]:
@@ -41,57 +46,71 @@ class _Veo31Base(BaseKieVideoNode):
                 }),
                 "resolution": (_RESOLUTIONS, {"default": "720p"}),
                 "aspect_ratio": (_ASPECT_RATIOS, {"default": "16:9"}),
-                "duration": ("INT", {"default": 8, "min": 4, "max": 8, "step": 2}),
-                "generate_audio": ("BOOLEAN", {"default": True}),
             },
             "optional": {
-                "image_url": ("STRING", {"default": "",
-                              "tooltip": "Optional first-frame image URL "
-                                         "for image-to-video."}),
-                "negative_prompt": ("STRING", {"multiline": True, "default": ""}),
+                "image_url": ("STRING", {
+                    "default": "",
+                    "tooltip": "Optional first-frame image URL for image-to-video.",
+                }),
+                "last_frame_url": ("STRING", {
+                    "default": "",
+                    "tooltip": "Optional last-frame URL. If set with image_url, "
+                               "uses FIRST_AND_LAST_FRAMES_2_VIDEO mode.",
+                }),
+                "enable_translation": ("BOOLEAN", {"default": True}),
+                "watermark": ("STRING", {"default": ""}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 2**31 - 1}),
             },
         }
 
-    def build_input(self, **kwargs: Any) -> dict[str, Any]:
-        body: dict[str, Any] = {
-            "prompt": kwargs["prompt"],
-            "resolution": kwargs["resolution"],
-            "aspect_ratio": kwargs["aspect_ratio"],
-            "duration": int(kwargs["duration"]),
-            "generate_audio": bool(kwargs.get("generate_audio", True)),
-        }
+    def build_veo_request(self, **kwargs: Any) -> dict[str, Any]:
+        prompt: str = kwargs["prompt"]
+        resolution: str = kwargs["resolution"]
+        aspect_ratio: str = kwargs["aspect_ratio"]
+
         image_url = (kwargs.get("image_url") or "").strip()
-        if image_url:
-            body["image_url"] = image_url
+        last_frame_url = (kwargs.get("last_frame_url") or "").strip()
 
-        negative = (kwargs.get("negative_prompt") or "").strip()
-        if negative:
-            body["negative_prompt"] = negative
+        image_urls: list[str] | None = None
+        generation_type: str
+        if image_url and last_frame_url:
+            image_urls = [image_url, last_frame_url]
+            generation_type = "FIRST_AND_LAST_FRAMES_2_VIDEO"
+        elif image_url:
+            image_urls = [image_url]
+            generation_type = "FIRST_AND_LAST_FRAMES_2_VIDEO"
+        else:
+            generation_type = "TEXT_2_VIDEO"
 
+        watermark = (kwargs.get("watermark") or "").strip() or None
         seed = int(kwargs.get("seed") or 0)
-        if seed > 0:
-            body["seed"] = seed
+        seeds = seed if seed > 0 else None
 
-        return body
+        return {
+            "prompt": prompt,
+            "image_urls": image_urls,
+            "aspect_ratio": aspect_ratio,
+            "resolution": resolution,
+            "generation_type": generation_type,
+            "enable_translation": bool(kwargs.get("enable_translation", True)),
+            "watermark": watermark,
+            "seeds": seeds,
+        }
 
 
 class Veo31Lite(_Veo31Base):
-    """Cheapest Veo 3.1 tier. Great for iteration."""
-
-    MODEL_ID = "google/veo-3.1-lite"
+    """Veo 3.1 Lite — cheapest tier (~$0.15/8s 720p)."""
+    MODEL = "veo3_lite"
 
 
 class Veo31Fast(_Veo31Base):
-    """Balanced Veo 3.1 tier — most common production workhorse."""
-
-    MODEL_ID = "google/veo-3.1-fast"
+    """Veo 3.1 Fast — balanced quality/cost (~$0.30/8s 720p)."""
+    MODEL = "veo3_fast"
 
 
 class Veo31Quality(_Veo31Base):
-    """Top-tier Veo 3.1. Slower and more expensive; use for finals."""
-
-    MODEL_ID = "google/veo-3.1-quality"
+    """Veo 3.1 Quality — flagship tier (~$1.25/8s 720p)."""
+    MODEL = "veo3"
 
 
 # ----------------------------------------------------------------- Registration

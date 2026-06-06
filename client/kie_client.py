@@ -1,19 +1,30 @@
 """HTTP client for Kie.ai.
 
-Kie.ai uses an async task-based model:
+Kie.ai exposes TWO different endpoint patterns:
 
-1. POST /api/v1/jobs/createTask  with { model, input }
-   → returns { code, msg, data: { taskId } }
+1. **Market generic** (Seedance, Kling, Hailuo, Wan, ElevenLabs, Claude, etc):
 
-2. GET /api/v1/jobs/recordInfo?taskId={taskId}  (polling)
-   → returns { code, msg, data: { status, output, ... } }
+   - POST /api/v1/jobs/createTask  with { model, input: {...} }
+   - GET  /api/v1/jobs/recordInfo?taskId=X
+   - Status lives in ``data.state`` (waiting/queuing/generating/success/fail)
+   - Result URLs live in ``data.resultJson`` (a JSON-encoded STRING)
+     containing ``{"resultUrls": [...]}`` or ``{"resultObject": {...}}``.
 
-All nodes in this package delegate to :class:`KieClient` for the actual HTTP
-work. Individual nodes only declare their model name and input parameters.
+2. **Veo dedicated** (Veo 3.1 only):
+
+   - POST /api/v1/veo/generate     with { prompt, model: "veo3_fast", ... }
+     (parameters are NOT wrapped in an ``input`` key)
+   - GET  /api/v1/veo/record-info?taskId=X
+   - Status lives in ``data.successFlag`` (0=generating, 1=success, 2/3=failed)
+   - Result URLs live in ``data.response.resultUrls`` (array, NOT a JSON string)
+
+This client exposes two pairs of methods, one per pattern, plus convenience
+``run_market`` / ``run_veo`` wrappers that hide the polling details.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from typing import Any
@@ -31,23 +42,29 @@ from .exceptions import (
 
 log = logging.getLogger("genesis_kie")
 
-# Status values returned by Kie.ai. We treat anything not in COMPLETED/FAILED
-# as "still running".
-_STATUS_COMPLETED = {"completed", "success", "succeeded", "finished"}
-_STATUS_FAILED = {"failed", "error", "cancelled", "canceled"}
+# Market endpoint state values.
+_MARKET_STATE_COMPLETED = {"success"}
+_MARKET_STATE_FAILED = {"fail"}
 
-# Polling defaults. These can be overridden per-call.
+# Veo endpoint successFlag values.
+_VEO_FLAG_GENERATING = 0
+_VEO_FLAG_SUCCESS = 1
+_VEO_FLAG_FAILED = 2
+_VEO_FLAG_GEN_FAILED = 3
+
+# Inner ``code`` values that mean SUCCESS at the API level.
+_OK_CODES = {200}
+
+# Polling defaults.
 _DEFAULT_POLL_INTERVAL_SECONDS = 3.0
-_DEFAULT_TIMEOUT_SECONDS = 600.0  # 10 minutes
+_DEFAULT_TIMEOUT_SECONDS = 600.0
 _DEFAULT_REQUEST_TIMEOUT_SECONDS = 30.0
 
 
 class KieClient:
     """Thin HTTP client around the Kie.ai REST API.
 
-    The client is intentionally stateless: each ComfyUI node that needs Kie
-    can instantiate one on the fly. Authentication and base URL are resolved
-    at construction time from environment variables.
+    Supports both the Market generic endpoints and the Veo dedicated endpoints.
     """
 
     def __init__(
@@ -92,9 +109,9 @@ class KieClient:
         except httpx.HTTPError as exc:
             raise KieError(f"HTTP {method} {path} failed: {exc}") from exc
 
-        if response.status_code == 401 or response.status_code == 403:
+        if response.status_code in (401, 403):
             raise KieAuthError(
-                f"Authentication failed ({response.status_code}). "
+                f"Authentication failed (HTTP {response.status_code}). "
                 "Verify your KIE_API_KEY.",
                 code=response.status_code,
             )
@@ -106,7 +123,8 @@ class KieClient:
             )
         if response.status_code >= 500:
             raise KieError(
-                f"Kie.ai server error ({response.status_code}): {response.text}",
+                f"Kie.ai server error (HTTP {response.status_code}): "
+                f"{response.text[:200]}",
                 code=response.status_code,
             )
 
@@ -117,56 +135,48 @@ class KieClient:
                 f"Invalid JSON response from {path}: {response.text[:200]}"
             ) from exc
 
-        # Kie wraps everything in { code, msg, data }. A non-200 inner code is
-        # treated as an error even if HTTP says 200.
         inner_code = payload.get("code")
-        if inner_code is not None and inner_code != 200:
-            raise KieError(
-                payload.get("msg") or f"Unknown error (code={inner_code})",
-                code=inner_code,
-            )
+        if inner_code is not None and inner_code not in _OK_CODES:
+            msg = payload.get("msg") or f"Unknown error (code={inner_code})"
+            if inner_code in (401, 403):
+                raise KieAuthError(msg, code=inner_code)
+            if inner_code == 429:
+                raise KieRateLimitError(msg, code=inner_code)
+            raise KieError(msg, code=inner_code)
 
         return payload
 
-    # ------------------------------------------------------- task lifecycle
+    # =============================================== MARKET PATTERN (generic)
 
-    def create_task(self, model: str, inputs: dict[str, Any],
-                    callback_url: str | None = None) -> str:
-        """Create a new async generation task.
+    def create_market_task(
+        self,
+        model: str,
+        inputs: dict[str, Any],
+        callback_url: str | None = None,
+    ) -> str:
+        """Create a task in the Market generic endpoint.
 
-        Args:
-            model: The Kie.ai model identifier (e.g. ``"google/veo-3.1-fast"``).
-            inputs: Model-specific input dict.
-            callback_url: Optional webhook URL that Kie.ai will POST to on
-                completion. If provided, polling is not strictly required.
-
-        Returns:
-            The ``taskId`` assigned by Kie.ai.
+        Used for: Seedance, Kling, Hailuo, Wan, HappyHorse, Grok Imagine,
+        ElevenLabs, Claude, GPT, Gemini, Nano Banana, Ideogram, etc.
         """
-        body: dict[str, Any] = {
-            "model": model,
-            "input": inputs,
-        }
+        body: dict[str, Any] = {"model": model, "input": inputs}
         if callback_url:
             body["callBackUrl"] = callback_url
 
-        log.debug("Kie createTask model=%s", model)
+        log.debug("Kie createMarketTask model=%s", model)
         payload = self._request("POST", "/api/v1/jobs/createTask", json=body)
 
         data = payload.get("data") or {}
         task_id = data.get("taskId") or data.get("task_id")
         if not task_id:
             raise KieError(
-                "Kie.ai response did not include a taskId: "
-                f"{payload}"
+                f"Kie.ai response did not include a taskId: {payload}"
             )
-        log.info("Kie task created model=%s taskId=%s", model, task_id)
+        log.info("Kie market task created model=%s taskId=%s", model, task_id)
         return task_id
 
-    def get_task(self, task_id: str) -> dict[str, Any]:
-        """Fetch the current state of a task. Returns the ``data`` portion
-        of the response.
-        """
+    def get_market_task(self, task_id: str) -> dict[str, Any]:
+        """Fetch a market task's current state."""
         payload = self._request(
             "GET",
             "/api/v1/jobs/recordInfo",
@@ -174,7 +184,7 @@ class KieClient:
         )
         return payload.get("data") or {}
 
-    def wait_for_task(
+    def wait_for_market_task(
         self,
         task_id: str,
         *,
@@ -182,25 +192,18 @@ class KieClient:
         timeout: float = _DEFAULT_TIMEOUT_SECONDS,
         progress_callback: Any = None,
     ) -> dict[str, Any]:
-        """Block until the task completes, fails, or times out.
+        """Poll a market task until success/fail/timeout.
 
-        Args:
-            task_id: Task identifier returned by :meth:`create_task`.
-            poll_interval: Seconds between polling requests.
-            timeout: Maximum total time to wait, in seconds.
-            progress_callback: Optional callable that receives each polled
-                ``data`` dict — useful for surfacing progress in ComfyUI.
-
-        Returns:
-            The final ``data`` dict from Kie.ai.
+        Returns the ``data`` dict with ``_parsed_result`` (the parsed
+        ``resultJson``) merged in.
         """
         deadline = time.monotonic() + timeout
         attempts = 0
 
         while True:
             attempts += 1
-            data = self.get_task(task_id)
-            status = (data.get("status") or "").lower()
+            data = self.get_market_task(task_id)
+            state = (data.get("state") or "").lower()
 
             if progress_callback is not None:
                 try:
@@ -208,34 +211,33 @@ class KieClient:
                 except Exception:  # noqa: BLE001
                     log.debug("Progress callback raised; ignoring", exc_info=True)
 
-            if status in _STATUS_COMPLETED:
+            if state in _MARKET_STATE_COMPLETED:
+                data["_parsed_result"] = self._parse_result_json(data)
                 log.info(
-                    "Kie task completed taskId=%s attempts=%d",
-                    task_id,
-                    attempts,
+                    "Kie market task succeeded taskId=%s attempts=%d cost_time=%sms",
+                    task_id, attempts, data.get("costTime"),
                 )
                 return data
 
-            if status in _STATUS_FAILED:
-                err_msg = (
-                    data.get("errorMessage")
-                    or data.get("error")
+            if state in _MARKET_STATE_FAILED:
+                fail_code = data.get("failCode") or ""
+                fail_msg = (
+                    data.get("failMsg")
                     or data.get("msg")
                     or "Task failed without a specific error message."
                 )
-                raise KieTaskFailedError(err_msg, task_id=task_id)
+                err = f"{fail_msg} (failCode={fail_code})" if fail_code else fail_msg
+                raise KieTaskFailedError(err, task_id=task_id)
 
             if time.monotonic() >= deadline:
                 raise KieTimeoutError(
-                    f"Task {task_id} did not complete within {timeout:.0f}s "
-                    f"(last status={status!r})"
+                    f"Market task {task_id} did not complete within {timeout:.0f}s "
+                    f"(last state={state!r})"
                 )
 
             time.sleep(poll_interval)
 
-    # ---------------------------------------------------- one-shot convenience
-
-    def run(
+    def run_market(
         self,
         model: str,
         inputs: dict[str, Any],
@@ -244,31 +246,207 @@ class KieClient:
         timeout: float = _DEFAULT_TIMEOUT_SECONDS,
         progress_callback: Any = None,
     ) -> dict[str, Any]:
-        """Create a task and block until it finishes.
-
-        This is the method most node implementations should use.
-        """
-        task_id = self.create_task(model, inputs)
-        return self.wait_for_task(
+        """Convenience: create + poll a market task."""
+        task_id = self.create_market_task(model, inputs)
+        return self.wait_for_market_task(
             task_id,
             poll_interval=poll_interval,
             timeout=timeout,
             progress_callback=progress_callback,
         )
 
+    # ================================================= VEO PATTERN (dedicated)
+
+    def create_veo_task(
+        self,
+        *,
+        prompt: str,
+        model: str = "veo3_fast",
+        image_urls: list[str] | None = None,
+        aspect_ratio: str = "16:9",
+        resolution: str = "720p",
+        generation_type: str | None = None,
+        enable_translation: bool = True,
+        watermark: str | None = None,
+        callback_url: str | None = None,
+        seeds: int | None = None,
+    ) -> str:
+        """Create a Veo 3.1 task using the dedicated API.
+
+        Args:
+            prompt: Required text prompt.
+            model: One of ``"veo3"``, ``"veo3_fast"``, ``"veo3_lite"``.
+            image_urls: Optional list of 1-2 image URLs (for image-to-video).
+            aspect_ratio: ``"16:9"``, ``"9:16"``, or ``"Auto"``.
+            resolution: ``"720p"``, ``"1080p"``, or ``"4k"``.
+            generation_type: ``"TEXT_2_VIDEO"``, ``"FIRST_AND_LAST_FRAMES_2_VIDEO"``,
+                or ``"REFERENCE_2_VIDEO"``. Auto-detected if omitted.
+            enable_translation: Translate prompt to English (default True).
+            watermark: Optional watermark text.
+            callback_url: Optional webhook URL.
+            seeds: Optional seed for reproducibility.
+        """
+        body: dict[str, Any] = {
+            "prompt": prompt,
+            "model": model,
+            "aspect_ratio": aspect_ratio,
+            "resolution": resolution,
+            "enableTranslation": enable_translation,
+        }
+        if image_urls:
+            body["imageUrls"] = image_urls
+        if generation_type:
+            body["generationType"] = generation_type
+        if watermark:
+            body["watermark"] = watermark
+        if callback_url:
+            body["callBackUrl"] = callback_url
+        if seeds is not None:
+            body["seeds"] = seeds
+
+        log.debug("Kie createVeoTask model=%s", model)
+        payload = self._request("POST", "/api/v1/veo/generate", json=body)
+
+        data = payload.get("data") or {}
+        task_id = data.get("taskId") or data.get("task_id")
+        if not task_id:
+            raise KieError(
+                f"Kie.ai response did not include a taskId: {payload}"
+            )
+        log.info("Kie veo task created model=%s taskId=%s", model, task_id)
+        return task_id
+
+    def get_veo_task(self, task_id: str) -> dict[str, Any]:
+        """Fetch a Veo task's current state."""
+        payload = self._request(
+            "GET",
+            "/api/v1/veo/record-info",
+            params={"taskId": task_id},
+        )
+        return payload.get("data") or {}
+
+    def wait_for_veo_task(
+        self,
+        task_id: str,
+        *,
+        poll_interval: float = _DEFAULT_POLL_INTERVAL_SECONDS,
+        timeout: float = _DEFAULT_TIMEOUT_SECONDS,
+        progress_callback: Any = None,
+    ) -> dict[str, Any]:
+        """Poll a Veo task until completion."""
+        deadline = time.monotonic() + timeout
+        attempts = 0
+
+        while True:
+            attempts += 1
+            data = self.get_veo_task(task_id)
+            flag = data.get("successFlag")
+
+            if progress_callback is not None:
+                try:
+                    progress_callback(data)
+                except Exception:  # noqa: BLE001
+                    log.debug("Progress callback raised; ignoring", exc_info=True)
+
+            if flag == _VEO_FLAG_SUCCESS:
+                log.info(
+                    "Kie veo task succeeded taskId=%s attempts=%d",
+                    task_id, attempts,
+                )
+                return data
+
+            if flag in (_VEO_FLAG_FAILED, _VEO_FLAG_GEN_FAILED):
+                err_code = data.get("errorCode")
+                err_msg = (
+                    data.get("errorMessage")
+                    or data.get("msg")
+                    or f"Veo task failed (flag={flag})"
+                )
+                err = f"{err_msg} (errorCode={err_code})" if err_code else err_msg
+                raise KieTaskFailedError(err, task_id=task_id)
+
+            if time.monotonic() >= deadline:
+                raise KieTimeoutError(
+                    f"Veo task {task_id} did not complete within {timeout:.0f}s "
+                    f"(last successFlag={flag})"
+                )
+
+            time.sleep(poll_interval)
+
+    def run_veo(
+        self,
+        *,
+        prompt: str,
+        model: str = "veo3_fast",
+        image_urls: list[str] | None = None,
+        aspect_ratio: str = "16:9",
+        resolution: str = "720p",
+        generation_type: str | None = None,
+        enable_translation: bool = True,
+        watermark: str | None = None,
+        seeds: int | None = None,
+        poll_interval: float = 5.0,
+        timeout: float = 900.0,
+        progress_callback: Any = None,
+    ) -> dict[str, Any]:
+        """Convenience: create + poll a Veo task."""
+        task_id = self.create_veo_task(
+            prompt=prompt,
+            model=model,
+            image_urls=image_urls,
+            aspect_ratio=aspect_ratio,
+            resolution=resolution,
+            generation_type=generation_type,
+            enable_translation=enable_translation,
+            watermark=watermark,
+            seeds=seeds,
+        )
+        return self.wait_for_veo_task(
+            task_id,
+            poll_interval=poll_interval,
+            timeout=timeout,
+            progress_callback=progress_callback,
+        )
+
+    # ------------------------------------------------------------- helpers
+
+    @staticmethod
+    def _parse_result_json(data: dict[str, Any]) -> dict[str, Any]:
+        """Parse the ``resultJson`` string into a dict (Market endpoints only)."""
+        raw = data.get("resultJson")
+        if not raw:
+            return {}
+        if isinstance(raw, dict):
+            return raw
+        if isinstance(raw, str):
+            try:
+                return json.loads(raw)
+            except (ValueError, TypeError):
+                log.warning("Could not parse resultJson: %r", raw[:200])
+                return {}
+        return {}
+
     # ---------------------------------------------------------- account utils
 
     def get_credits_remaining(self) -> int | None:
-        """Best-effort fetch of remaining credits. Returns ``None`` if the
-        endpoint is unavailable.
-        """
+        """Best-effort fetch of remaining credits."""
         try:
             payload = self._request("GET", "/api/v1/chat/credit")
         except KieError:
             return None
-        data = payload.get("data") or {}
-        credits = data.get("credits") or data.get("balance")
+        data = payload.get("data")
+        if isinstance(data, dict):
+            credits = (
+                data.get("credits")
+                or data.get("balance")
+                or data.get("remaining")
+            )
+            try:
+                return int(credits) if credits is not None else None
+            except (TypeError, ValueError):
+                return None
+        # Sometimes the endpoint returns the number directly
         try:
-            return int(credits) if credits is not None else None
+            return int(data) if data is not None else None
         except (TypeError, ValueError):
             return None

@@ -10,6 +10,20 @@ module bridges the gap by:
 
 We keep torch / numpy / PIL imports lazy so this package can still be
 imported in environments where ComfyUI is not present (e.g. tests).
+
+Kie.ai result structure (after KieClient parses ``resultJson``):
+
+    data = {
+        "state": "success",
+        "resultJson": '{"resultUrls": ["https://..."]}',  # raw JSON string
+        "_parsed_result": {                                # added by KieClient
+            "resultUrls": ["https://..."],
+        },
+        ...
+    }
+
+Use :func:`first_url` against ``data["_parsed_result"]`` (or against ``data``
+directly — the helper looks in both places).
 """
 
 from __future__ import annotations
@@ -88,7 +102,10 @@ def download_to_output(
     # Find a non-conflicting filename.
     counter = 0
     while True:
-        candidate = f"{prefix}_{stem}_{counter:04d}.{ext}" if counter else f"{prefix}_{stem}.{ext}"
+        if counter == 0:
+            candidate = f"{prefix}_{stem}.{ext}"
+        else:
+            candidate = f"{prefix}_{stem}_{counter:04d}.{ext}"
         path = out_dir / candidate
         if not path.exists():
             break
@@ -134,15 +151,47 @@ def image_url_to_tensor(url: str) -> Any:
     return tensor
 
 
-def first_url(data: dict[str, Any], keys: list[str]) -> str | None:
-    """Pick the first non-empty URL from a Kie ``data`` dict.
+def first_url(data: dict[str, Any], keys: list[str] | None = None) -> str | None:
+    """Pick the first non-empty result URL from a Kie ``data`` dict.
 
-    Different Kie endpoints return result URLs under different keys
-    (``video_url``, ``image_url``, ``url``, ``output``, etc). This helper
-    walks a list of candidate keys and returns the first that resolves to a
-    non-empty string.
+    Kie stores the actual result inside ``resultJson`` (a JSON string).
+    :class:`KieClient.wait_for_task` parses this into ``data["_parsed_result"]``
+    automatically. This helper looks there first, then falls back to scanning
+    legacy / direct keys for resilience.
+
+    The standard Kie shape is::
+
+        data["_parsed_result"] = {"resultUrls": ["https://...", ...]}
+
+    Args:
+        data: The ``data`` dict returned by ``wait_for_task`` or ``run``.
+        keys: Optional list of additional fallback keys to scan after
+            ``resultUrls`` (useful for non-standard responses or legacy
+            endpoints).
     """
-    for key in keys:
+    # 1. Standard path: parsed resultJson with resultUrls list.
+    parsed = data.get("_parsed_result") or {}
+    if isinstance(parsed, dict):
+        urls = parsed.get("resultUrls")
+        if isinstance(urls, list) and urls:
+            for item in urls:
+                if isinstance(item, str) and item:
+                    return item
+                if isinstance(item, dict):
+                    url = item.get("url") or item.get("imageUrl") or item.get("videoUrl")
+                    if isinstance(url, str) and url:
+                        return url
+
+    # 2. Fallback: scan well-known direct keys on the data dict itself.
+    fallback_keys = keys or [
+        "video_url", "videoUrl", "video",
+        "image_url", "imageUrl", "image",
+        "audio_url", "audioUrl", "audio",
+        "music_url", "url",
+        "output_video_url", "output_image_url",
+        "output", "result",
+    ]
+    for key in fallback_keys:
         value = data.get(key)
         if isinstance(value, str) and value:
             return value
@@ -158,4 +207,26 @@ def first_url(data: dict[str, Any], keys: list[str]) -> str | None:
             url = value.get("url") or value.get("image_url") or value.get("video_url")
             if isinstance(url, str) and url:
                 return url
+
     return None
+
+
+def all_urls(data: dict[str, Any]) -> list[str]:
+    """Return ALL result URLs from a Kie ``data`` dict.
+
+    Useful for endpoints that return multiple outputs (e.g. Nano Banana with
+    ``num_images > 1``, or Seedance with first/last frames).
+    """
+    out: list[str] = []
+    parsed = data.get("_parsed_result") or {}
+    if isinstance(parsed, dict):
+        urls = parsed.get("resultUrls")
+        if isinstance(urls, list):
+            for item in urls:
+                if isinstance(item, str) and item:
+                    out.append(item)
+                elif isinstance(item, dict):
+                    url = item.get("url") or item.get("imageUrl") or item.get("videoUrl")
+                    if isinstance(url, str) and url:
+                        out.append(url)
+    return out
