@@ -483,3 +483,322 @@ class BaseKieFluxKontextNode(BaseKieNode):
         log.info("Flux kontext URLs: %d returned", len(urls))
         tensor = images_urls_to_tensor(urls)
         return (tensor,)
+
+
+# =============================================== SUNO MUSIC (dedicated API)
+
+class BaseKieSunoMusicNode(BaseKieNode):
+    """Base for Suno music-generation nodes (dedicated endpoint).
+
+    These nodes return THREE outputs:
+
+    - ``audio_path`` (STRING): local path to the FIRST audio variant.
+      Connect to a Save/Play node downstream.
+    - ``audio_id`` (STRING): Suno's internal ID for the first variant.
+      Required to chain into Extend / AddVocals / Cover / Replace nodes.
+    - ``all_paths_csv`` (STRING): comma-separated paths of ALL variants
+      (Suno typically returns 2-4 candidates per request).
+
+    Subclasses set:
+    - ``CREATE_ENDPOINT``: the POST URL (e.g. "/api/v1/generate").
+    - ``POLLING_ENDPOINT``: GET URL (typically "/api/v1/generate/record-info").
+    - Override ``build_suno_body()`` to map ComfyUI inputs → request body.
+    """
+
+    CATEGORY = CATEGORY_MUSIC
+    RETURN_TYPES = ("STRING", "STRING", "STRING")
+    RETURN_NAMES = ("audio_path", "audio_id", "all_paths_csv")
+
+    CREATE_ENDPOINT: ClassVar[str] = ""
+    POLLING_ENDPOINT: ClassVar[str] = "/api/v1/generate/record-info"
+
+    TIMEOUT_SECONDS = 600.0
+    POLL_INTERVAL_SECONDS = 5.0
+
+    def build_suno_body(self, **kwargs: Any) -> dict[str, Any]:
+        """Translate ComfyUI inputs into the Suno request body."""
+        return {k: v for k, v in kwargs.items() if v not in (None, "")}
+
+    def run(self, **kwargs: Any) -> tuple[str, ...]:
+        if not self.CREATE_ENDPOINT:
+            raise KieError(f"{type(self).__name__} did not declare CREATE_ENDPOINT.")
+
+        body = self.build_suno_body(**kwargs)
+
+        with KieClient() as client:
+            last_status = [None]
+
+            def on_progress(d: dict[str, Any]) -> None:
+                status = d.get("status")
+                if status != last_status[0]:
+                    log.info("Suno status=%s", status)
+                    last_status[0] = status
+
+            data = client.run_suno_task(
+                self.CREATE_ENDPOINT,
+                self.POLLING_ENDPOINT,
+                body,
+                poll_interval=self.POLL_INTERVAL_SECONDS,
+                timeout=self.TIMEOUT_SECONDS,
+                progress_callback=on_progress,
+            )
+
+        return self.extract_output(data)
+
+    def extract_output(self, data: dict[str, Any]) -> tuple[str, ...]:
+        """Pull audio URLs from ``data.response.sunoData`` and download them."""
+        response = data.get("response") or {}
+        suno_data = response.get("sunoData") or []
+
+        if not suno_data:
+            raise KieError(
+                "Suno task returned no sunoData. "
+                f"response keys: {list(response.keys())}, "
+                f"data keys: {list(data.keys())}"
+            )
+
+        # Suno typically returns 2-4 audio candidates.
+        paths: list[str] = []
+        ids: list[str] = []
+        for item in suno_data:
+            if not isinstance(item, dict):
+                continue
+            url = item.get("audioUrl")
+            audio_id = item.get("id")
+            if not url:
+                continue
+            path = download_to_output(url, prefix="kie_suno", fallback_ext="mp3")
+            paths.append(path)
+            if audio_id:
+                ids.append(audio_id)
+
+        if not paths:
+            raise KieError(f"Suno sunoData had no audioUrl entries. sunoData: {suno_data}")
+
+        log.info("Suno returned %d variant(s)", len(paths))
+        first_path = paths[0]
+        first_id = ids[0] if ids else ""
+        all_paths_csv = ",".join(paths)
+        return (first_path, first_id, all_paths_csv)
+
+
+# ============================================= SUNO TEXT (Lyrics / Timestamped)
+
+class BaseKieSunoTextNode(BaseKieNode):
+    """Base for Suno endpoints that return TEXT (lyrics, timestamps).
+
+    Output:
+    - ``text`` (STRING): the lyrics or JSON-stringified timestamps.
+
+    Subclasses set CREATE_ENDPOINT + POLLING_ENDPOINT (or override run()
+    for synchronous endpoints).
+    """
+
+    CATEGORY = CATEGORY_MUSIC
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("text",)
+
+    CREATE_ENDPOINT: ClassVar[str] = ""
+    POLLING_ENDPOINT: ClassVar[str] = ""
+
+    TIMEOUT_SECONDS = 180.0
+    POLL_INTERVAL_SECONDS = 2.0
+
+    def build_suno_body(self, **kwargs: Any) -> dict[str, Any]:
+        return {k: v for k, v in kwargs.items() if v not in (None, "")}
+
+    def run(self, **kwargs: Any) -> tuple[str, ...]:
+        if not self.CREATE_ENDPOINT:
+            raise KieError(f"{type(self).__name__} did not declare CREATE_ENDPOINT.")
+
+        body = self.build_suno_body(**kwargs)
+
+        with KieClient() as client:
+            data = client.run_suno_task(
+                self.CREATE_ENDPOINT,
+                self.POLLING_ENDPOINT,
+                body,
+                poll_interval=self.POLL_INTERVAL_SECONDS,
+                timeout=self.TIMEOUT_SECONDS,
+            )
+
+        return self.extract_output(data)
+
+    def extract_output(self, data: dict[str, Any]) -> tuple[str, ...]:
+        """Subclasses customize per endpoint shape."""
+        response = data.get("response") or {}
+        # Try common field names
+        for key in ("lyrics", "text", "lyricsData", "timestampedLyrics"):
+            value = response.get(key)
+            if isinstance(value, str) and value:
+                return (value,)
+            if isinstance(value, (list, dict)):
+                import json
+                return (json.dumps(value, ensure_ascii=False),)
+        raise KieError(
+            f"Suno text task returned no usable text. response keys: "
+            f"{list(response.keys())}"
+        )
+
+
+# ============================================= SUNO AUDIO UTILITY (WAV/Stem/MIDI)
+
+class BaseKieSunoAudioUtilityNode(BaseKieNode):
+    """Base for Suno audio-utility endpoints (WAV convert, MIDI, etc).
+
+    Returns a single audio/midi file path.
+
+    Subclasses set:
+    - ``CREATE_ENDPOINT``: e.g. "/api/v1/wav/generate".
+    - ``POLLING_ENDPOINT``: e.g. "/api/v1/wav/record-info".
+    - ``OUTPUT_EXT``: file extension hint ("wav", "mid", "mp3").
+    - ``RESULT_FIELD``: response field with the URL (typically
+      "audioUrl" or "midiUrl").
+    """
+
+    CATEGORY = CATEGORY_MUSIC
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("audio_path",)
+
+    CREATE_ENDPOINT: ClassVar[str] = ""
+    POLLING_ENDPOINT: ClassVar[str] = ""
+    OUTPUT_EXT: ClassVar[str] = "mp3"
+    RESULT_FIELD: ClassVar[str] = "audioUrl"
+
+    TIMEOUT_SECONDS = 300.0
+    POLL_INTERVAL_SECONDS = 3.0
+
+    def build_suno_body(self, **kwargs: Any) -> dict[str, Any]:
+        return {k: v for k, v in kwargs.items() if v not in (None, "")}
+
+    def run(self, **kwargs: Any) -> tuple[str, ...]:
+        if not self.CREATE_ENDPOINT:
+            raise KieError(f"{type(self).__name__} did not declare CREATE_ENDPOINT.")
+
+        body = self.build_suno_body(**kwargs)
+
+        with KieClient() as client:
+            data = client.run_suno_task(
+                self.CREATE_ENDPOINT,
+                self.POLLING_ENDPOINT,
+                body,
+                poll_interval=self.POLL_INTERVAL_SECONDS,
+                timeout=self.TIMEOUT_SECONDS,
+            )
+
+        return self.extract_output(data)
+
+    def extract_output(self, data: dict[str, Any]) -> tuple[str, ...]:
+        response = data.get("response") or {}
+        url = response.get(self.RESULT_FIELD)
+        if not url:
+            # Try nested arrays (e.g. vocal removal returns multiple stems)
+            for key in ("audioUrls", "audios", "stems", "results"):
+                arr = response.get(key)
+                if isinstance(arr, list) and arr:
+                    first = arr[0]
+                    if isinstance(first, str):
+                        url = first
+                        break
+                    if isinstance(first, dict):
+                        url = first.get("url") or first.get("audioUrl")
+                        if url:
+                            break
+        if not url:
+            raise KieError(
+                f"Suno audio utility task: no '{self.RESULT_FIELD}' URL found. "
+                f"response keys: {list(response.keys())}"
+            )
+        path = download_to_output(url, prefix="kie_suno_util", fallback_ext=self.OUTPUT_EXT)
+        return (path,)
+
+
+# =============================================== SUNO STEM SEPARATION (multi-output)
+
+class BaseKieSunoStemSeparationNode(BaseKieNode):
+    """Base for Suno Vocal Removal / Stem Separation (multi-stem output).
+
+    Vocal removal returns multiple stems (vocal + instrumental, or
+    full multi-instrument separation depending on ``type`` param).
+
+    Outputs:
+    - ``vocals_path`` (STRING): isolated vocals stem
+    - ``instrumental_path`` (STRING): instrumental (no-vocals) stem
+    - ``all_stems_csv`` (STRING): comma-separated paths of all returned stems
+    """
+
+    CATEGORY = CATEGORY_MUSIC
+    RETURN_TYPES = ("STRING", "STRING", "STRING")
+    RETURN_NAMES = ("vocals_path", "instrumental_path", "all_stems_csv")
+
+    CREATE_ENDPOINT: ClassVar[str] = "/api/v1/vocal-removal/generate"
+    POLLING_ENDPOINT: ClassVar[str] = "/api/v1/vocal-removal/record-info"
+
+    TIMEOUT_SECONDS = 300.0
+    POLL_INTERVAL_SECONDS = 3.0
+
+    def build_suno_body(self, **kwargs: Any) -> dict[str, Any]:
+        return {k: v for k, v in kwargs.items() if v not in (None, "")}
+
+    def run(self, **kwargs: Any) -> tuple[str, ...]:
+        body = self.build_suno_body(**kwargs)
+
+        with KieClient() as client:
+            data = client.run_suno_task(
+                self.CREATE_ENDPOINT,
+                self.POLLING_ENDPOINT,
+                body,
+                poll_interval=self.POLL_INTERVAL_SECONDS,
+                timeout=self.TIMEOUT_SECONDS,
+            )
+
+        return self.extract_output(data)
+
+    def extract_output(self, data: dict[str, Any]) -> tuple[str, ...]:
+        response = data.get("response") or {}
+
+        # Try named keys first (the documented shape may use vocalUrl/instrumentalUrl).
+        vocals_url = response.get("vocalUrl") or response.get("vocalsUrl")
+        instr_url = response.get("instrumentalUrl") or response.get("noVocalsUrl")
+        all_urls: list[str] = []
+
+        if vocals_url:
+            all_urls.append(vocals_url)
+        if instr_url:
+            all_urls.append(instr_url)
+
+        # Try generic arrays.
+        if not all_urls:
+            for key in ("stems", "audioUrls", "results"):
+                arr = response.get(key)
+                if isinstance(arr, list):
+                    for item in arr:
+                        if isinstance(item, str):
+                            all_urls.append(item)
+                        elif isinstance(item, dict):
+                            url = item.get("url") or item.get("audioUrl")
+                            if url:
+                                all_urls.append(url)
+                    if all_urls:
+                        break
+
+        if not all_urls:
+            raise KieError(
+                f"Vocal removal task returned no stem URLs. "
+                f"response keys: {list(response.keys())}"
+            )
+
+        # Download each stem
+        paths: list[str] = []
+        for url in all_urls:
+            path = download_to_output(url, prefix="kie_stem", fallback_ext="mp3")
+            paths.append(path)
+
+        vocals_path = paths[0] if vocals_url else (paths[0] if paths else "")
+        instrumental_path = paths[1] if instr_url and len(paths) >= 2 else (
+            paths[1] if len(paths) >= 2 else ""
+        )
+        all_stems_csv = ",".join(paths)
+
+        log.info("Vocal removal returned %d stems", len(paths))
+        return (vocals_path, instrumental_path, all_stems_csv)

@@ -1,6 +1,6 @@
 """HTTP client for Kie.ai.
 
-Kie.ai exposes FIVE different endpoint patterns:
+Kie.ai exposes SIX different endpoint patterns:
 
 1. **Market generic** (Seedance, Kling, Hailuo, Wan, ElevenLabs, Claude, etc):
 
@@ -44,9 +44,43 @@ Kie.ai exposes FIVE different endpoint patterns:
    - Status lives in ``data.successFlag`` (Veo-style: 0/1/2/3)
    - Result URLs live in ``data.response.resultUrls``
 
+6. **Suno dedicated** (music generation + audio utilities):
+
+   - POST /api/v1/generate              (Generate Music)
+     POST /api/v1/generate/extend       (Extend Music)
+     POST /api/v1/generate/upload-cover (Upload And Cover)
+     POST /api/v1/generate/upload-extend (Upload And Extend)
+     POST /api/v1/generate/add-instrumental
+     POST /api/v1/generate/add-vocals
+     POST /api/v1/generate/boost-style
+     POST /api/v1/generate/cover-suno   (Music Cover)
+     POST /api/v1/generate/replace-section
+     POST /api/v1/generate/generate-persona
+     POST /api/v1/generate/mashup
+     (all use camelCase body, no ``input`` wrapper)
+
+   - Polling: GET /api/v1/generate/record-info?taskId=X (shared)
+   - Status: ``data.status`` ("SUCCESS"/"FAIL"/etc — Runway-style)
+   - Result: ``data.response.sunoData`` array of objects with
+     ``id``, ``audioUrl``, ``streamAudioUrl``, ``imageUrl``,
+     ``title``, ``tags``, ``duration``
+
+   Sister utility endpoints share the Suno polling pattern but have
+   their own create + polling URLs:
+
+   - Lyrics:        POST /api/v1/lyrics/generate
+                     GET  /api/v1/lyrics/record-info
+   - WAV convert:   POST /api/v1/wav/generate
+                     GET  /api/v1/wav/record-info
+   - Vocal removal: POST /api/v1/vocal-removal/generate
+                     GET  /api/v1/vocal-removal/record-info
+   - MIDI gen:      POST /api/v1/midi/generate
+                     GET  /api/v1/midi/record-info
+
 This client exposes method pairs per pattern, plus convenience
 ``run_market`` / ``run_veo`` / ``run_runway`` / ``run_4o_image`` /
-``run_flux_kontext`` wrappers that hide the polling details.
+``run_flux_kontext`` / ``run_suno_task`` wrappers that hide the
+polling details.
 
 For the Gemini Omni helper endpoints (audio/character creation), see
 ``create_omni_resource`` — these are synchronous and return immediately.
@@ -894,6 +928,152 @@ class KieClient:
             safety_tolerance=safety_tolerance,
         )
         return self.wait_for_flux_kontext_task(
+            task_id,
+            poll_interval=poll_interval,
+            timeout=timeout,
+            progress_callback=progress_callback,
+        )
+
+    # ================================================ SUNO PATTERN (dedicated)
+    #
+    # Suno tasks use ``data.status`` (string) instead of successFlag.
+    # Status values seen: PENDING, TEXT_SUCCESS, FIRST_SUCCESS, SUCCESS,
+    # CREATE_TASK_FAILED, GENERATE_AUDIO_FAILED, CALLBACK_EXCEPTION,
+    # SENSITIVE_WORD_ERROR.
+
+    _SUNO_TERMINAL_OK = "SUCCESS"
+    _SUNO_TERMINAL_ERRORS = (
+        "CREATE_TASK_FAILED",
+        "GENERATE_AUDIO_FAILED",
+        "CALLBACK_EXCEPTION",
+        "SENSITIVE_WORD_ERROR",
+    )
+
+    def create_suno_task(
+        self,
+        create_endpoint: str,
+        body: dict[str, Any],
+        callback_url: str | None = None,
+    ) -> str:
+        """Create a Suno-style task. Returns taskId.
+
+        Args:
+            create_endpoint: e.g. "/api/v1/generate", "/api/v1/lyrics".
+            body: request body (camelCase keys, no ``input`` wrapper).
+            callback_url: optional callBackUrl override.
+
+        Note: Suno endpoints REQUIRE a ``callBackUrl`` field even when
+        polling is used instead of webhooks. If neither ``callback_url``
+        nor ``body["callBackUrl"]`` is provided, a placeholder URL is
+        injected automatically — the webhook itself is never invoked
+        because we poll for the result.
+        """
+        request_body = dict(body)
+        if callback_url:
+            request_body["callBackUrl"] = callback_url
+        elif "callBackUrl" not in request_body:
+            # Suno requires callBackUrl. We poll instead of using webhooks,
+            # so set a placeholder that the API will accept but never invoke.
+            request_body["callBackUrl"] = "https://example.com/no-callback"
+
+        log.debug("Kie createSunoTask endpoint=%s", create_endpoint)
+        payload = self._request("POST", create_endpoint, json=request_body)
+        data = payload.get("data") or {}
+        task_id = data.get("taskId") or data.get("task_id")
+        if not task_id:
+            raise KieError(f"Kie.ai response did not include a taskId: {payload}")
+        log.info("Kie suno task created endpoint=%s taskId=%s", create_endpoint, task_id)
+        return task_id
+
+    def get_suno_task(self, polling_endpoint: str, task_id: str) -> dict[str, Any]:
+        """Fetch a Suno-style task's current state.
+
+        Args:
+            polling_endpoint: e.g. "/api/v1/generate/record-info".
+            task_id: the task id returned by ``create_suno_task``.
+        """
+        payload = self._request(
+            "GET",
+            polling_endpoint,
+            params={"taskId": task_id},
+        )
+        return payload.get("data") or {}
+
+    def wait_for_suno_task(
+        self,
+        polling_endpoint: str,
+        task_id: str,
+        *,
+        poll_interval: float = _DEFAULT_POLL_INTERVAL_SECONDS,
+        timeout: float = _DEFAULT_TIMEOUT_SECONDS,
+        progress_callback: Any = None,
+    ) -> dict[str, Any]:
+        """Poll a Suno-style task until completion.
+
+        Uses ``data.status`` string. Returns when status == "SUCCESS".
+        Raises on known terminal errors or timeout.
+        """
+        deadline = time.monotonic() + timeout
+        attempts = 0
+
+        while True:
+            attempts += 1
+            data = self.get_suno_task(polling_endpoint, task_id)
+            status = data.get("status")
+
+            if progress_callback is not None:
+                try:
+                    progress_callback(data)
+                except Exception:  # noqa: BLE001
+                    log.debug("Progress callback raised; ignoring", exc_info=True)
+
+            if status == self._SUNO_TERMINAL_OK:
+                log.info(
+                    "Kie suno task succeeded endpoint=%s taskId=%s attempts=%d",
+                    polling_endpoint, task_id, attempts,
+                )
+                return data
+
+            if status in self._SUNO_TERMINAL_ERRORS:
+                err_code = data.get("errorCode")
+                err_msg = (
+                    data.get("errorMessage")
+                    or data.get("msg")
+                    or f"Suno task failed (status={status})"
+                )
+                err = f"{err_msg} (errorCode={err_code})" if err_code else err_msg
+                raise KieTaskFailedError(err, task_id=task_id)
+
+            if time.monotonic() >= deadline:
+                raise KieTimeoutError(
+                    f"Suno task {task_id} did not complete within {timeout:.0f}s "
+                    f"(last status={status})"
+                )
+
+            time.sleep(poll_interval)
+
+    def run_suno_task(
+        self,
+        create_endpoint: str,
+        polling_endpoint: str,
+        body: dict[str, Any],
+        *,
+        poll_interval: float = 5.0,
+        timeout: float = 600.0,
+        progress_callback: Any = None,
+    ) -> dict[str, Any]:
+        """Convenience: create + poll a Suno-style task.
+
+        For music endpoints (``/api/v1/generate``, ``/extend``, etc), use
+        polling_endpoint=``/api/v1/generate/record-info``.
+
+        For utility endpoints (lyrics, wav, vocal-removal, midi), the
+        polling endpoint typically mirrors the create endpoint (replace
+        ``/generate`` with ``/record-info``).
+        """
+        task_id = self.create_suno_task(create_endpoint, body)
+        return self.wait_for_suno_task(
+            polling_endpoint,
             task_id,
             poll_interval=poll_interval,
             timeout=timeout,
