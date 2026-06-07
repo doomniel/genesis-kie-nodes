@@ -1,6 +1,6 @@
 """HTTP client for Kie.ai.
 
-Kie.ai exposes THREE different endpoint patterns:
+Kie.ai exposes FIVE different endpoint patterns:
 
 1. **Market generic** (Seedance, Kling, Hailuo, Wan, ElevenLabs, Claude, etc):
 
@@ -28,9 +28,25 @@ Kie.ai exposes THREE different endpoint patterns:
    - Status lives in ``data.state`` (wait/success/fail)
    - Result URL lives in ``data.videoInfo.videoUrl``
 
+4. **4o Image dedicated** (OpenAI GPT 4o Image):
+
+   - POST /api/v1/gpt4o-image/generate with { prompt, filesUrl[], size, ... }
+     (camelCase at top level, no ``input`` wrapper)
+   - GET  /api/v1/gpt4o-image/record-info?taskId=X
+   - Status lives in ``data.successFlag`` (Veo-style: 0/1/2/3)
+   - Result URLs live in ``data.response.resultUrls`` (array)
+
+5. **Flux Kontext dedicated** (BFL Flux Kontext):
+
+   - POST /api/v1/flux/kontext/generate with { prompt, model, aspectRatio,
+     enableTranslation, outputFormat, promptUpsampling, safetyTolerance, ... }
+   - GET  /api/v1/flux/kontext/record-info?taskId=X
+   - Status lives in ``data.successFlag`` (Veo-style: 0/1/2/3)
+   - Result URLs live in ``data.response.resultUrls``
+
 This client exposes method pairs per pattern, plus convenience
-``run_market`` / ``run_veo`` / ``run_runway`` wrappers that hide the
-polling details.
+``run_market`` / ``run_veo`` / ``run_runway`` / ``run_4o_image`` /
+``run_flux_kontext`` wrappers that hide the polling details.
 
 For the Gemini Omni helper endpoints (audio/character creation), see
 ``create_omni_resource`` — these are synchronous and return immediately.
@@ -597,6 +613,292 @@ class KieClient:
                 log.warning("Could not parse resultJson: %r", raw[:200])
                 return {}
         return {}
+
+    # =============================================== 4O IMAGE PATTERN (dedicated)
+
+    def create_4o_image_task(
+        self,
+        *,
+        prompt: str,
+        files_url: list[str] | None = None,
+        size: str = "1:1",
+        n_variants: int = 1,
+        is_enhance: bool = False,
+        upload_cn: bool = False,
+        enable_fallback: bool = False,
+        fallback_model: str | None = None,
+        callback_url: str | None = None,
+    ) -> str:
+        """Create a 4o Image task using the dedicated API.
+
+        Endpoint: ``POST /api/v1/gpt4o-image/generate``
+
+        Body uses camelCase top-level keys (filesUrl, callBackUrl, isEnhance,
+        uploadCn, enableFallback, fallbackModel) — NOT wrapped in ``input``.
+
+        Note: nVariants is informally documented; if rejected, drop it and
+        call the endpoint multiple times.
+        """
+        body: dict[str, Any] = {
+            "prompt": prompt,
+            "size": size,
+            "isEnhance": is_enhance,
+            "uploadCn": upload_cn,
+            "enableFallback": enable_fallback,
+            "nVariants": n_variants,
+        }
+        if files_url:
+            body["filesUrl"] = files_url
+        if fallback_model:
+            body["fallbackModel"] = fallback_model
+        if callback_url:
+            body["callBackUrl"] = callback_url
+
+        log.debug("Kie create4oImageTask")
+        payload = self._request("POST", "/api/v1/gpt4o-image/generate", json=body)
+        data = payload.get("data") or {}
+        task_id = data.get("taskId") or data.get("task_id")
+        if not task_id:
+            raise KieError(f"Kie.ai response did not include a taskId: {payload}")
+        log.info("Kie 4o image task created taskId=%s", task_id)
+        return task_id
+
+    def get_4o_image_task(self, task_id: str) -> dict[str, Any]:
+        """Fetch a 4o image task's current state."""
+        payload = self._request(
+            "GET",
+            "/api/v1/gpt4o-image/record-info",
+            params={"taskId": task_id},
+        )
+        return payload.get("data") or {}
+
+    def wait_for_4o_image_task(
+        self,
+        task_id: str,
+        *,
+        poll_interval: float = _DEFAULT_POLL_INTERVAL_SECONDS,
+        timeout: float = _DEFAULT_TIMEOUT_SECONDS,
+        progress_callback: Any = None,
+    ) -> dict[str, Any]:
+        """Poll a 4o image task until completion.
+
+        Uses successFlag like Veo:
+        - 0 = generating
+        - 1 = success
+        - 2 = failed
+        - 3 = generation failed
+        """
+        deadline = time.monotonic() + timeout
+        attempts = 0
+
+        while True:
+            attempts += 1
+            data = self.get_4o_image_task(task_id)
+            flag = data.get("successFlag")
+
+            if progress_callback is not None:
+                try:
+                    progress_callback(data)
+                except Exception:  # noqa: BLE001
+                    log.debug("Progress callback raised; ignoring", exc_info=True)
+
+            if flag == _VEO_FLAG_SUCCESS:
+                log.info(
+                    "Kie 4o image task succeeded taskId=%s attempts=%d",
+                    task_id, attempts,
+                )
+                return data
+
+            if flag in (_VEO_FLAG_FAILED, _VEO_FLAG_GEN_FAILED):
+                err_code = data.get("errorCode")
+                err_msg = (
+                    data.get("errorMessage")
+                    or data.get("msg")
+                    or f"4o image task failed (flag={flag})"
+                )
+                err = f"{err_msg} (errorCode={err_code})" if err_code else err_msg
+                raise KieTaskFailedError(err, task_id=task_id)
+
+            if time.monotonic() >= deadline:
+                raise KieTimeoutError(
+                    f"4o image task {task_id} did not complete within {timeout:.0f}s "
+                    f"(last successFlag={flag})"
+                )
+
+            time.sleep(poll_interval)
+
+    def run_4o_image(
+        self,
+        *,
+        prompt: str,
+        files_url: list[str] | None = None,
+        size: str = "1:1",
+        n_variants: int = 1,
+        is_enhance: bool = False,
+        upload_cn: bool = False,
+        enable_fallback: bool = False,
+        fallback_model: str | None = None,
+        poll_interval: float = 3.0,
+        timeout: float = 600.0,
+        progress_callback: Any = None,
+    ) -> dict[str, Any]:
+        """Convenience: create + poll a 4o image task."""
+        task_id = self.create_4o_image_task(
+            prompt=prompt,
+            files_url=files_url,
+            size=size,
+            n_variants=n_variants,
+            is_enhance=is_enhance,
+            upload_cn=upload_cn,
+            enable_fallback=enable_fallback,
+            fallback_model=fallback_model,
+        )
+        return self.wait_for_4o_image_task(
+            task_id,
+            poll_interval=poll_interval,
+            timeout=timeout,
+            progress_callback=progress_callback,
+        )
+
+    # ========================================== FLUX KONTEXT PATTERN (dedicated)
+
+    def create_flux_kontext_task(
+        self,
+        *,
+        prompt: str,
+        model: str = "flux-kontext-pro",
+        input_image: str | None = None,
+        aspect_ratio: str | None = None,
+        output_format: str = "jpeg",
+        prompt_upsampling: bool = False,
+        enable_translation: bool = True,
+        safety_tolerance: int = 2,
+        callback_url: str | None = None,
+    ) -> str:
+        """Create a Flux Kontext task using the dedicated API.
+
+        Endpoint: ``POST /api/v1/flux/kontext/generate``
+
+        Models: ``flux-kontext-pro`` or ``flux-kontext-max``.
+        If ``input_image`` is provided, becomes an image-edit task; otherwise
+        text-to-image.
+        """
+        body: dict[str, Any] = {
+            "prompt": prompt,
+            "model": model,
+            "outputFormat": output_format,
+            "promptUpsampling": prompt_upsampling,
+            "enableTranslation": enable_translation,
+            "safetyTolerance": safety_tolerance,
+        }
+        if input_image:
+            body["inputImage"] = input_image
+        if aspect_ratio:
+            body["aspectRatio"] = aspect_ratio
+        if callback_url:
+            body["callBackUrl"] = callback_url
+
+        log.debug("Kie createFluxKontextTask model=%s", model)
+        payload = self._request("POST", "/api/v1/flux/kontext/generate", json=body)
+        data = payload.get("data") or {}
+        task_id = data.get("taskId") or data.get("task_id")
+        if not task_id:
+            raise KieError(f"Kie.ai response did not include a taskId: {payload}")
+        log.info("Kie flux kontext task created model=%s taskId=%s", model, task_id)
+        return task_id
+
+    def get_flux_kontext_task(self, task_id: str) -> dict[str, Any]:
+        """Fetch a Flux Kontext task's current state."""
+        payload = self._request(
+            "GET",
+            "/api/v1/flux/kontext/record-info",
+            params={"taskId": task_id},
+        )
+        return payload.get("data") or {}
+
+    def wait_for_flux_kontext_task(
+        self,
+        task_id: str,
+        *,
+        poll_interval: float = _DEFAULT_POLL_INTERVAL_SECONDS,
+        timeout: float = _DEFAULT_TIMEOUT_SECONDS,
+        progress_callback: Any = None,
+    ) -> dict[str, Any]:
+        """Poll a Flux Kontext task until completion.
+
+        Uses successFlag like Veo/4o (0=gen, 1=success, 2/3=failed).
+        """
+        deadline = time.monotonic() + timeout
+        attempts = 0
+
+        while True:
+            attempts += 1
+            data = self.get_flux_kontext_task(task_id)
+            flag = data.get("successFlag")
+
+            if progress_callback is not None:
+                try:
+                    progress_callback(data)
+                except Exception:  # noqa: BLE001
+                    log.debug("Progress callback raised; ignoring", exc_info=True)
+
+            if flag == _VEO_FLAG_SUCCESS:
+                log.info(
+                    "Kie flux kontext task succeeded taskId=%s attempts=%d",
+                    task_id, attempts,
+                )
+                return data
+
+            if flag in (_VEO_FLAG_FAILED, _VEO_FLAG_GEN_FAILED):
+                err_code = data.get("errorCode")
+                err_msg = (
+                    data.get("errorMessage")
+                    or data.get("msg")
+                    or f"Flux kontext task failed (flag={flag})"
+                )
+                err = f"{err_msg} (errorCode={err_code})" if err_code else err_msg
+                raise KieTaskFailedError(err, task_id=task_id)
+
+            if time.monotonic() >= deadline:
+                raise KieTimeoutError(
+                    f"Flux kontext task {task_id} did not complete within {timeout:.0f}s "
+                    f"(last successFlag={flag})"
+                )
+
+            time.sleep(poll_interval)
+
+    def run_flux_kontext(
+        self,
+        *,
+        prompt: str,
+        model: str = "flux-kontext-pro",
+        input_image: str | None = None,
+        aspect_ratio: str | None = None,
+        output_format: str = "jpeg",
+        prompt_upsampling: bool = False,
+        enable_translation: bool = True,
+        safety_tolerance: int = 2,
+        poll_interval: float = 3.0,
+        timeout: float = 600.0,
+        progress_callback: Any = None,
+    ) -> dict[str, Any]:
+        """Convenience: create + poll a Flux Kontext task."""
+        task_id = self.create_flux_kontext_task(
+            prompt=prompt,
+            model=model,
+            input_image=input_image,
+            aspect_ratio=aspect_ratio,
+            output_format=output_format,
+            prompt_upsampling=prompt_upsampling,
+            enable_translation=enable_translation,
+            safety_tolerance=safety_tolerance,
+        )
+        return self.wait_for_flux_kontext_task(
+            task_id,
+            poll_interval=poll_interval,
+            timeout=timeout,
+            progress_callback=progress_callback,
+        )
 
     # ---------------------------------------------------------- account utils
 

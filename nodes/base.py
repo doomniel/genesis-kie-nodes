@@ -30,9 +30,11 @@ from typing import Any, ClassVar
 from ..client import (
     KieClient,
     KieError,
+    all_urls,
     download_to_output,
     first_url,
     image_url_to_tensor,
+    images_urls_to_tensor,
 )
 
 log = logging.getLogger("genesis_kie")
@@ -142,7 +144,17 @@ class BaseKieMarketVideoNode(BaseKieNode):
 
 
 class BaseKieMarketImageNode(BaseKieNode):
-    """Base for image nodes using the Market endpoint."""
+    """Base for image nodes using the Market endpoint.
+
+    Returns a ComfyUI ``IMAGE`` tensor of shape ``(B, H, W, C)``.
+    When the API returns multiple images (e.g. Seedream 4.0 with
+    ``max_images=4``, Wan 2.7 Image with ``n=4``, Ideogram with
+    ``num_images>1``), they are stacked into a single batch tensor.
+
+    All images are resized to the smallest common (W, H) to allow batch
+    stacking. If you need original sizes, subclass and override
+    :meth:`extract_output` to return only the first URL.
+    """
 
     CATEGORY = CATEGORY_IMAGE
     RETURN_TYPES = ("IMAGE",)
@@ -156,6 +168,11 @@ class BaseKieMarketImageNode(BaseKieNode):
             raise KieError(f"{type(self).__name__} did not declare MODEL.")
 
         inputs = self.build_input(**kwargs)
+        log.debug(
+            "Kie market image node=%s model=%s inputs=%s",
+            type(self).__name__, self.MODEL, inputs,
+        )
+
         with KieClient() as client:
             data = client.run_market(
                 self.MODEL,
@@ -167,8 +184,13 @@ class BaseKieMarketImageNode(BaseKieNode):
         return self.extract_output(data)
 
     def extract_output(self, data: dict[str, Any]) -> tuple[Any, ...]:
-        url = first_url(data)
-        if not url:
+        urls = all_urls(data)
+        if not urls:
+            # Fallback to first_url in case all_urls returned empty.
+            single = first_url(data)
+            if single:
+                urls = [single]
+        if not urls:
             parsed = data.get("_parsed_result") or {}
             raise KieError(
                 "Kie returned no image URL. "
@@ -176,7 +198,8 @@ class BaseKieMarketImageNode(BaseKieNode):
                 f"{list(parsed.keys()) if isinstance(parsed, dict) else 'n/a'}, "
                 f"data keys: {list(data.keys())}"
             )
-        tensor = image_url_to_tensor(url)
+        log.info("Kie image URLs: %d returned", len(urls))
+        tensor = images_urls_to_tensor(urls)
         return (tensor,)
 
 
@@ -337,3 +360,126 @@ class BaseKieVeoVideoNode(BaseKieNode):
         log.info("Veo video URL: %s", video_url)
         path = download_to_output(video_url, prefix="kie_veo", fallback_ext="mp4")
         return (path,)
+
+
+# ================================================== 4O IMAGE (dedicated API)
+
+class BaseKie4oImageNode(BaseKieNode):
+    """Base for OpenAI 4o Image nodes (dedicated endpoint).
+
+    Like Veo, this uses a top-level camelCase body (no ``input`` wrapper)
+    and ``data.successFlag`` for status. Result URLs live at
+    ``data.response.resultUrls``.
+
+    Subclasses set how many variants are requested and override
+    :meth:`build_4o_request` to populate ``run_4o_image`` kwargs.
+    """
+
+    CATEGORY = CATEGORY_IMAGE
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+
+    TIMEOUT_SECONDS = 600.0
+    POLL_INTERVAL_SECONDS = 3.0
+
+    def build_4o_request(self, **kwargs: Any) -> dict[str, Any]:
+        """Translate ComfyUI inputs into kwargs for ``client.run_4o_image()``.
+
+        Default expects ComfyUI kwargs match ``run_4o_image``'s parameters.
+        Override to map or rename fields.
+        """
+        return kwargs
+
+    def run(self, **kwargs: Any) -> tuple[Any, ...]:
+        request_kwargs = self.build_4o_request(**kwargs)
+
+        with KieClient() as client:
+            last_flag = [None]
+
+            def on_progress(d: dict[str, Any]) -> None:
+                flag = d.get("successFlag")
+                if flag != last_flag[0]:
+                    log.info("4o image successFlag=%s", flag)
+                    last_flag[0] = flag
+
+            data = client.run_4o_image(
+                poll_interval=self.POLL_INTERVAL_SECONDS,
+                timeout=self.TIMEOUT_SECONDS,
+                progress_callback=on_progress,
+                **request_kwargs,
+            )
+
+        return self.extract_output(data)
+
+    def extract_output(self, data: dict[str, Any]) -> tuple[Any, ...]:
+        urls = all_urls(data)
+        if not urls:
+            raise KieError(
+                "4o image returned no resultUrls. "
+                f"response keys: {list((data.get('response') or {}).keys())}, "
+                f"data keys: {list(data.keys())}"
+            )
+        log.info("4o image URLs: %d returned", len(urls))
+        tensor = images_urls_to_tensor(urls)
+        return (tensor,)
+
+
+# =============================================== FLUX KONTEXT (dedicated API)
+
+class BaseKieFluxKontextNode(BaseKieNode):
+    """Base for Flux Kontext nodes (dedicated endpoint).
+
+    Like 4o Image / Veo: top-level camelCase body, ``successFlag`` status,
+    ``response.resultUrls`` result.
+
+    Subclasses set ``MODEL`` (``flux-kontext-pro`` or ``flux-kontext-max``)
+    and override :meth:`build_kontext_request` if needed.
+    """
+
+    CATEGORY = CATEGORY_IMAGE
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+
+    TIMEOUT_SECONDS = 600.0
+    POLL_INTERVAL_SECONDS = 3.0
+
+    def build_kontext_request(self, **kwargs: Any) -> dict[str, Any]:
+        """Translate ComfyUI inputs into kwargs for ``client.run_flux_kontext()``."""
+        return kwargs
+
+    def run(self, **kwargs: Any) -> tuple[Any, ...]:
+        if not self.MODEL:
+            raise KieError(f"{type(self).__name__} did not declare MODEL.")
+
+        request_kwargs = self.build_kontext_request(**kwargs)
+        request_kwargs.setdefault("model", self.MODEL)
+
+        with KieClient() as client:
+            last_flag = [None]
+
+            def on_progress(d: dict[str, Any]) -> None:
+                flag = d.get("successFlag")
+                if flag != last_flag[0]:
+                    log.info("Flux kontext successFlag=%s", flag)
+                    last_flag[0] = flag
+
+            data = client.run_flux_kontext(
+                poll_interval=self.POLL_INTERVAL_SECONDS,
+                timeout=self.TIMEOUT_SECONDS,
+                progress_callback=on_progress,
+                **request_kwargs,
+            )
+
+        return self.extract_output(data)
+
+    def extract_output(self, data: dict[str, Any]) -> tuple[Any, ...]:
+        urls = all_urls(data)
+        if not urls:
+            raise KieError(
+                "Flux kontext returned no resultUrls. "
+                f"response keys: {list((data.get('response') or {}).keys())}, "
+                f"data keys: {list(data.keys())}"
+            )
+        log.info("Flux kontext URLs: %d returned", len(urls))
+        tensor = images_urls_to_tensor(urls)
+        return (tensor,)

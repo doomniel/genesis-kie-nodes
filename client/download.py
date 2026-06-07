@@ -24,6 +24,10 @@ Kie.ai result structure (after KieClient parses ``resultJson``):
 
 Use :func:`first_url` against ``data["_parsed_result"]`` (or against ``data``
 directly — the helper looks in both places).
+
+For DEDICATED endpoints (Veo, Runway, 4o, Flux Kontext), result URLs live in
+``data.response.resultUrls`` (Veo, 4o) or ``data.videoInfo.videoUrl`` (Runway).
+Use :func:`response_result_urls` for the Veo/4o shape.
 """
 
 from __future__ import annotations
@@ -58,20 +62,37 @@ def _comfyui_output_dir() -> Path:
         return Path.cwd() / "output"
 
 
-def _safe_filename(url: str, fallback_ext: str = "bin") -> str:
-    parsed = urlparse(url)
-    name = os.path.basename(parsed.path) or f"kie_output.{fallback_ext}"
-    # Strip query strings / unsafe chars
+def _safe_filename(url: str, prefix: str = "kie_output", fallback_ext: str = "bin") -> str:
+    """Build a safe local filename from a URL."""
+    try:
+        parsed = urlparse(url)
+        name = os.path.basename(parsed.path) or ""
+    except Exception:  # noqa: BLE001
+        name = ""
+    if not name:
+        name = f"{prefix}.{fallback_ext}"
+    # Strip unsafe chars
     name = re.sub(r"[^A-Za-z0-9._-]", "_", name)
     if "." not in name:
         name = f"{name}.{fallback_ext}"
-    return name
+    # Avoid collisions
+    out_dir = _comfyui_output_dir()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    target = out_dir / name
+    counter = 1
+    while target.exists():
+        stem = target.stem
+        suffix = target.suffix
+        target = out_dir / f"{stem}_{counter}{suffix}"
+        counter += 1
+    return str(target)
 
 
-def download_bytes(url: str, *, timeout: float = _DOWNLOAD_TIMEOUT_SECONDS) -> bytes:
-    """Fetch the URL and return its raw bytes."""
+def download_bytes(url: str) -> bytes:
+    """Download a URL and return its raw bytes."""
+    log.debug("Kie download bytes url=%s", url)
     try:
-        with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+        with httpx.Client(timeout=_DOWNLOAD_TIMEOUT_SECONDS, follow_redirects=True) as client:
             response = client.get(url)
             response.raise_for_status()
             return response.content
@@ -82,54 +103,23 @@ def download_bytes(url: str, *, timeout: float = _DOWNLOAD_TIMEOUT_SECONDS) -> b
 def download_to_output(
     url: str,
     *,
-    prefix: str = "kie",
+    prefix: str = "kie_output",
     fallback_ext: str = "bin",
-    timeout: float = _DOWNLOAD_TIMEOUT_SECONDS,
 ) -> str:
-    """Download ``url`` into ComfyUI's output dir and return the absolute path.
-
-    The filename is derived from the URL with a unique numeric suffix to avoid
-    collisions across runs.
-    """
-    out_dir = _comfyui_output_dir()
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    base_name = _safe_filename(url, fallback_ext=fallback_ext)
-    stem, dot, ext = base_name.rpartition(".")
-    if not dot:
-        stem, ext = base_name, fallback_ext
-
-    # Find a non-conflicting filename.
-    counter = 0
-    while True:
-        if counter == 0:
-            candidate = f"{prefix}_{stem}.{ext}"
-        else:
-            candidate = f"{prefix}_{stem}_{counter:04d}.{ext}"
-        path = out_dir / candidate
-        if not path.exists():
-            break
-        counter += 1
-
-    log.info("Downloading Kie asset → %s", path)
+    """Download a URL and save to ComfyUI's output dir. Returns absolute path."""
+    target = _safe_filename(url, prefix=prefix, fallback_ext=fallback_ext)
+    log.info("Kie downloading to %s", target)
     try:
-        with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+        with httpx.Client(timeout=_DOWNLOAD_TIMEOUT_SECONDS, follow_redirects=True) as client:
             with client.stream("GET", url) as response:
                 response.raise_for_status()
-                with path.open("wb") as fp:
+                with open(target, "wb") as fp:
                     for chunk in response.iter_bytes(_CHUNK_SIZE):
                         if chunk:
                             fp.write(chunk)
     except httpx.HTTPError as exc:
-        # Clean up a partial file.
-        if path.exists():
-            try:
-                path.unlink()
-            except OSError:
-                pass
         raise KieError(f"Failed to download {url}: {exc}") from exc
-
-    return str(path)
+    return target
 
 
 def image_url_to_tensor(url: str) -> Any:
@@ -149,6 +139,56 @@ def image_url_to_tensor(url: str) -> Any:
     array = np.array(image, dtype=np.float32) / 255.0  # H, W, C
     tensor = torch.from_numpy(array).unsqueeze(0)  # 1, H, W, C
     return tensor
+
+
+def images_urls_to_tensor(urls: list[str]) -> Any:
+    """Download multiple image URLs and stack as a single batch tensor.
+
+    Output shape: ``(B, H, W, C)`` where B = len(urls).
+    All images are resized to the smallest common (W, H) to allow stacking;
+    if you need to preserve original sizes, call :func:`image_url_to_tensor`
+    per URL instead.
+
+    Used by endpoints that return multiple variants (e.g. 4o Image with
+    nVariants > 1, Wan 2.7 Image with n > 1, Ideogram with num_images > 1).
+    """
+    import io
+
+    import numpy as np
+    import torch
+    from PIL import Image
+
+    if not urls:
+        raise KieError("images_urls_to_tensor: no URLs provided.")
+
+    # Load all images.
+    pils: list[Image.Image] = []
+    for url in urls:
+        raw = download_bytes(url)
+        img = Image.open(io.BytesIO(raw)).convert("RGB")
+        pils.append(img)
+
+    # Single image fast path.
+    if len(pils) == 1:
+        array = np.array(pils[0], dtype=np.float32) / 255.0
+        return torch.from_numpy(array).unsqueeze(0)
+
+    # Find smallest common (W, H) so all fit into a single tensor.
+    min_w = min(img.width for img in pils)
+    min_h = min(img.height for img in pils)
+    log.info(
+        "images_urls_to_tensor: stacking %d images, resizing to (%d, %d)",
+        len(pils), min_w, min_h,
+    )
+
+    arrays = []
+    for img in pils:
+        if (img.width, img.height) != (min_w, min_h):
+            img = img.resize((min_w, min_h), Image.Resampling.LANCZOS)
+        arrays.append(np.array(img, dtype=np.float32) / 255.0)
+
+    stacked = np.stack(arrays, axis=0)  # B, H, W, C
+    return torch.from_numpy(stacked)
 
 
 def first_url(data: dict[str, Any], keys: list[str] | None = None) -> str | None:
@@ -182,7 +222,22 @@ def first_url(data: dict[str, Any], keys: list[str] | None = None) -> str | None
                     if isinstance(url, str) and url:
                         return url
 
-    # 2. Fallback: scan well-known direct keys on the data dict itself.
+    # 2. Veo / 4o / Kontext dedicated shape: data.response.resultUrls
+    response = data.get("response")
+    if isinstance(response, dict):
+        urls = response.get("resultUrls")
+        if isinstance(urls, list) and urls:
+            for item in urls:
+                if isinstance(item, str) and item:
+                    return item
+        # Flux Kontext shape: data.response.resultImageUrl (singular string).
+        # Note: response also has originImageUrl (input image), which we do NOT
+        # surface — only the generated result.
+        result_image = response.get("resultImageUrl")
+        if isinstance(result_image, str) and result_image:
+            return result_image
+
+    # 3. Fallback: scan well-known direct keys on the data dict itself.
     fallback_keys = keys or [
         "video_url", "videoUrl", "video",
         "image_url", "imageUrl", "image",
@@ -215,7 +270,12 @@ def all_urls(data: dict[str, Any]) -> list[str]:
     """Return ALL result URLs from a Kie ``data`` dict.
 
     Useful for endpoints that return multiple outputs (e.g. Nano Banana with
-    ``num_images > 1``, or Seedance with first/last frames).
+    ``num_images > 1``, Seedance with first/last frames, Wan 2.7 Image with
+    ``n=4``, 4o Image with ``nVariants > 1``).
+
+    Searches in priority order:
+    1. ``data["_parsed_result"]["resultUrls"]``     (Market endpoints)
+    2. ``data["response"]["resultUrls"]``           (Veo / 4o dedicated)
     """
     out: list[str] = []
     parsed = data.get("_parsed_result") or {}
@@ -229,4 +289,24 @@ def all_urls(data: dict[str, Any]) -> list[str]:
                     url = item.get("url") or item.get("imageUrl") or item.get("videoUrl")
                     if isinstance(url, str) and url:
                         out.append(url)
+    if out:
+        return out
+
+    response = data.get("response")
+    if isinstance(response, dict):
+        urls = response.get("resultUrls")
+        if isinstance(urls, list):
+            for item in urls:
+                if isinstance(item, str) and item:
+                    out.append(item)
+                elif isinstance(item, dict):
+                    url = item.get("url") or item.get("imageUrl")
+                    if isinstance(url, str) and url:
+                        out.append(url)
+        # Flux Kontext shape: data.response.resultImageUrl (singular string).
+        # originImageUrl is the INPUT image — intentionally NOT surfaced.
+        if not out:
+            result_image = response.get("resultImageUrl")
+            if isinstance(result_image, str) and result_image:
+                out.append(result_image)
     return out

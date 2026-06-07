@@ -2,10 +2,12 @@
 
 from .auth import get_api_key, get_base_url
 from .download import (
+    all_urls,
     download_bytes,
     download_to_output,
     first_url,
     image_url_to_tensor,
+    images_urls_to_tensor,
 )
 from .exceptions import (
     KieAuthError,
@@ -30,5 +32,7 @@ __all__ = [
     "download_bytes",
     "download_to_output",
     "first_url",
+    "all_urls",
     "image_url_to_tensor",
+    "images_urls_to_tensor",
 ]
