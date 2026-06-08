@@ -802,3 +802,389 @@ class BaseKieSunoStemSeparationNode(BaseKieNode):
 
         log.info("Vocal removal returned %d stems", len(paths))
         return (vocals_path, instrumental_path, all_stems_csv)
+
+
+# ================================================ CHAT / LLM BASES (synchronous)
+
+class BaseKieChatNode(BaseKieNode):
+    """Abstract base for all chat / LLM nodes (synchronous, no polling).
+
+    Common contract:
+    - Inputs: ``system_prompt``, ``user_prompt``, optional ``image_url`` for
+      multimodal models, ``max_tokens``, ``temperature``.
+    - Outputs: ``(text, tokens_used)`` — the assistant's reply as STRING +
+      total token usage as INT.
+
+    Subclasses set:
+    - ``ENDPOINT``: full Kie.ai path (e.g. "/gpt-5-2/v1/chat/completions").
+    - ``MODEL_ID``: the model identifier sent in the body
+      (e.g. "gpt-5-2", "claude-opus-4-8", "gemini-3.1-pro").
+    - Override ``build_body()`` to assemble the family-specific request shape.
+    - Override ``extract_output()`` to pull text + tokens from the response.
+
+    Multimodal: if ``image_url`` is provided, subclasses inject it as an
+    additional content part in the user message. Models that don't support
+    images will return an error from Kie.ai (we don't pre-validate).
+    """
+
+    CATEGORY = CATEGORY_LLM
+    RETURN_TYPES = ("STRING", "INT")
+    RETURN_NAMES = ("text", "tokens_used")
+
+    ENDPOINT: ClassVar[str] = ""
+    MODEL_ID: ClassVar[str] = ""
+
+    @classmethod
+    def INPUT_TYPES(cls) -> dict[str, Any]:
+        return {
+            "required": {
+                "user_prompt": ("STRING", {
+                    "multiline": True,
+                    "default": "Hello! Briefly introduce yourself.",
+                }),
+            },
+            "optional": {
+                "system_prompt": ("STRING", {
+                    "multiline": True,
+                    "default": "",
+                    "tooltip": "Optional system message (sets persona/context).",
+                }),
+                "image_url": ("STRING", {
+                    "default": "",
+                    "tooltip": "Optional image URL for multimodal models.",
+                }),
+                "max_tokens": ("INT", {
+                    "default": 2048, "min": 16, "max": 32768, "step": 16,
+                    "tooltip": "Maximum tokens to generate.",
+                }),
+                "temperature": ("FLOAT", {
+                    "default": 0.7, "min": 0.0, "max": 2.0, "step": 0.05,
+                    "tooltip": "Sampling temperature (0=deterministic, 1=normal, 2=very random).",
+                }),
+            },
+        }
+
+    def build_body(self, **kwargs: Any) -> dict[str, Any]:
+        """Family-specific: build the request body. Override in subclass."""
+        raise NotImplementedError
+
+    def extract_output(self, response: dict[str, Any]) -> tuple[Any, ...]:
+        """Family-specific: pull (text, tokens_used) from response. Override."""
+        raise NotImplementedError
+
+    def run(self, **kwargs: Any) -> tuple[Any, ...]:
+        if not self.ENDPOINT:
+            raise KieError(f"{type(self).__name__} did not declare ENDPOINT.")
+        if not self.MODEL_ID:
+            raise KieError(f"{type(self).__name__} did not declare MODEL_ID.")
+
+        body = self.build_body(**kwargs)
+
+        with KieClient() as client:
+            response = client.chat_completion(self.ENDPOINT, body)
+
+        return self.extract_output(response)
+
+
+# ------------------------------------------------ Patrón A — OpenAI Chat Completions
+
+class BaseKieChatOpenAINode(BaseKieChatNode):
+    """For models that use the OpenAI ``/v1/chat/completions`` shape.
+
+    Used by: GPT 5.2 and all Gemini variants (Gemini "openai" endpoints).
+
+    Body:
+        { messages: [{role, content}], temperature, max_tokens, ... }
+
+    Response:
+        { choices: [{ message: { content: "..." } }], usage: {...} }
+    """
+
+    def build_body(self, **kwargs: Any) -> dict[str, Any]:
+        messages: list[dict[str, Any]] = []
+
+        system_prompt = (kwargs.get("system_prompt") or "").strip()
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+
+        user_prompt = (kwargs.get("user_prompt") or "").strip()
+        image_url = (kwargs.get("image_url") or "").strip()
+
+        if image_url:
+            # Multimodal content: text + image_url parts in user message.
+            messages.append({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user_prompt or "What is in this image?"},
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                ],
+            })
+        else:
+            messages.append({"role": "user", "content": user_prompt})
+
+        body: dict[str, Any] = {
+            "model": self.MODEL_ID,
+            "messages": messages,
+            "max_tokens": int(kwargs.get("max_tokens", 2048)),
+            "temperature": float(kwargs.get("temperature", 0.7)),
+            "stream": False,
+        }
+        return body
+
+    def extract_output(self, response: dict[str, Any]) -> tuple[Any, ...]:
+        choices = response.get("choices") or []
+        if not choices:
+            raise KieError(
+                f"OpenAI chat response had no choices. Keys: {list(response.keys())}"
+            )
+        message = (choices[0] or {}).get("message") or {}
+        content = message.get("content")
+
+        # Content can be a plain string OR a list of content parts.
+        text = ""
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            parts: list[str] = []
+            for part in content:
+                if isinstance(part, dict):
+                    t = part.get("text") or part.get("content") or ""
+                    if isinstance(t, str):
+                        parts.append(t)
+                elif isinstance(part, str):
+                    parts.append(part)
+            text = "".join(parts)
+
+        if not text:
+            raise KieError(
+                f"OpenAI chat response had empty content. message: {message}"
+            )
+
+        usage = response.get("usage") or {}
+        tokens = int(usage.get("total_tokens") or 0)
+        return (text, tokens)
+
+
+# ------------------------------------------------ Patrón B — OpenAI Responses API
+
+class BaseKieChatResponsesNode(BaseKieChatNode):
+    """For models that use OpenAI's ``/v1/responses`` API shape.
+
+    Used by: GPT 5.4, GPT 5.5, GPT Codex.
+
+    Body:
+        { model, input: [{role, content: [{type, text|image_url}]}],
+          tools, reasoning: {effort}, stream }
+
+    Response:
+        { output: [
+            {type: "reasoning", ...},
+            {type: "message", content: [{type: "output_text", text: "..."}]}
+          ],
+          usage: {input_tokens, output_tokens, total_tokens},
+          credits_consumed, status: "completed" }
+
+    Extra input vs base:
+    - ``reasoning_effort``: low/medium/high/xhigh — how deeply the model thinks.
+    """
+
+    REASONING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh"]
+
+    @classmethod
+    def INPUT_TYPES(cls) -> dict[str, Any]:
+        types = super().INPUT_TYPES()
+        types["optional"]["reasoning_effort"] = (cls.REASONING_EFFORTS, {
+            "default": "medium",
+            "tooltip": "How deeply the model should reason (higher = slower + more tokens).",
+        })
+        return types
+
+    def build_body(self, **kwargs: Any) -> dict[str, Any]:
+        input_array: list[dict[str, Any]] = []
+
+        system_prompt = (kwargs.get("system_prompt") or "").strip()
+        if system_prompt:
+            # Responses API uses developer/system role similarly.
+            input_array.append({
+                "role": "system",
+                "content": [{"type": "input_text", "text": system_prompt}],
+            })
+
+        user_prompt = (kwargs.get("user_prompt") or "").strip()
+        image_url = (kwargs.get("image_url") or "").strip()
+
+        content_parts: list[dict[str, Any]] = [
+            {"type": "input_text", "text": user_prompt or "Describe the input."}
+        ]
+        if image_url:
+            content_parts.append({
+                "type": "input_image",
+                "image_url": image_url,
+            })
+
+        input_array.append({"role": "user", "content": content_parts})
+
+        body: dict[str, Any] = {
+            "model": self.MODEL_ID,
+            "input": input_array,
+            "stream": False,
+        }
+
+        reasoning_effort = kwargs.get("reasoning_effort", "medium")
+        if reasoning_effort:
+            body["reasoning"] = {"effort": reasoning_effort}
+
+        # NOTE: max_output_tokens is NOT included in the Responses API body.
+        # Kie.ai's gateway returns {"code":500,"msg":"Server exception"} when
+        # this field is present in /api/v1/responses requests (Codex endpoint).
+        # The field is also non-standard in the Responses API spec — the model
+        # uses its own default limit. The ``max_tokens`` input is kept for UI
+        # consistency with Chat Completions nodes but is intentionally ignored
+        # here. Verified via /home/claude debug script 2026-06.
+        # If you need a hard cap, switch to a Chat Completions model (GPT 5.2
+        # or any Gemini).
+        return body
+
+    def extract_output(self, response: dict[str, Any]) -> tuple[Any, ...]:
+        outputs = response.get("output") or []
+        if not outputs:
+            raise KieError(
+                f"Responses API: no output array. Keys: {list(response.keys())}"
+            )
+
+        # Find the first ``message`` block (skip reasoning blocks).
+        text = ""
+        for block in outputs:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") != "message":
+                continue
+            content = block.get("content") or []
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") in ("output_text", "text"):
+                    text += part.get("text", "")
+            if text:
+                break
+
+        if not text:
+            # Fallback: dump the full output for debugging.
+            import json
+            raise KieError(
+                f"Responses API: could not extract text. "
+                f"output: {json.dumps(outputs, ensure_ascii=False)[:300]}"
+            )
+
+        usage = response.get("usage") or {}
+        tokens = int(usage.get("total_tokens") or 0)
+        return (text, tokens)
+
+
+# ------------------------------------------------ Patrón C — Anthropic Messages
+
+class BaseKieChatAnthropicNode(BaseKieChatNode):
+    """For models that use Anthropic's ``/v1/messages`` shape.
+
+    Used by: all Claude models (Opus 4.5-4.8, Sonnet 4.5-4.6, Haiku 4.5).
+
+    Body:
+        { model, messages: [{role, content}], max_tokens, temperature,
+          system, thinking: {type, budget_tokens} }
+
+    Response:
+        { id, content: [{type: "text", text: "..."}], usage: {...} }
+
+    Extra input vs base:
+    - ``thinking``: enables extended reasoning ("thinking blocks") on Claude.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls) -> dict[str, Any]:
+        types = super().INPUT_TYPES()
+        types["optional"]["thinking"] = ("BOOLEAN", {
+            "default": False,
+            "tooltip": "Enable Claude's extended thinking (more accurate, slower).",
+        })
+        types["optional"]["thinking_budget"] = ("INT", {
+            "default": 4096, "min": 1024, "max": 32000, "step": 256,
+            "tooltip": "Token budget for thinking blocks (only used if thinking=true).",
+        })
+        return types
+
+    def build_body(self, **kwargs: Any) -> dict[str, Any]:
+        messages: list[dict[str, Any]] = []
+
+        user_prompt = (kwargs.get("user_prompt") or "").strip()
+        image_url = (kwargs.get("image_url") or "").strip()
+
+        if image_url:
+            # Anthropic image format expects ``source`` with type=url.
+            messages.append({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user_prompt or "Describe this image."},
+                    {
+                        "type": "image",
+                        "source": {"type": "url", "url": image_url},
+                    },
+                ],
+            })
+        else:
+            messages.append({"role": "user", "content": user_prompt})
+
+        body: dict[str, Any] = {
+            "model": self.MODEL_ID,
+            "messages": messages,
+            "max_tokens": int(kwargs.get("max_tokens", 2048)),
+            "stream": False,
+        }
+
+        # System prompt is its own field in Anthropic, not a message.
+        system_prompt = (kwargs.get("system_prompt") or "").strip()
+        if system_prompt:
+            body["system"] = system_prompt
+
+        # Temperature only matters if thinking is OFF.
+        thinking = bool(kwargs.get("thinking", False))
+        if thinking:
+            body["thinking"] = {
+                "type": "enabled",
+                "budget_tokens": int(kwargs.get("thinking_budget", 4096)),
+            }
+            # When thinking is on, temperature must be 1.0 (Anthropic constraint).
+            body["temperature"] = 1.0
+        else:
+            body["temperature"] = float(kwargs.get("temperature", 0.7))
+
+        return body
+
+    def extract_output(self, response: dict[str, Any]) -> tuple[Any, ...]:
+        content = response.get("content") or []
+        if not content:
+            raise KieError(
+                f"Anthropic response had no content. Keys: {list(response.keys())}"
+            )
+
+        # Find the first text block (skip thinking blocks).
+        text = ""
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text":
+                text += block.get("text", "")
+
+        if not text:
+            import json
+            raise KieError(
+                f"Anthropic response: could not extract text. "
+                f"content: {json.dumps(content, ensure_ascii=False)[:300]}"
+            )
+
+        usage = response.get("usage") or {}
+        # Anthropic uses input_tokens + output_tokens (no total_tokens).
+        tokens = int(
+            (usage.get("input_tokens") or 0)
+            + (usage.get("output_tokens") or 0)
+        )
+        return (text, tokens)

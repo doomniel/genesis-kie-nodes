@@ -1,6 +1,6 @@
 """HTTP client for Kie.ai.
 
-Kie.ai exposes SIX different endpoint patterns:
+Kie.ai exposes SEVEN different endpoint patterns:
 
 1. **Market generic** (Seedance, Kling, Hailuo, Wan, ElevenLabs, Claude, etc):
 
@@ -79,8 +79,32 @@ Kie.ai exposes SIX different endpoint patterns:
 
 This client exposes method pairs per pattern, plus convenience
 ``run_market`` / ``run_veo`` / ``run_runway`` / ``run_4o_image`` /
-``run_flux_kontext`` / ``run_suno_task`` wrappers that hide the
-polling details.
+``run_flux_kontext`` / ``run_suno_task`` / ``chat_completion`` wrappers
+that hide the polling details.
+
+7. **Chat / LLM (SYNCHRONOUS)** — no task IDs, no polling:
+
+   Three sub-patterns share the same synchronous-call infrastructure:
+
+   - **OpenAI Chat Completions** (GPT 5.2, all Gemini):
+     POST /<model>/v1/chat/completions  (e.g. /gpt-5-2/v1/chat/completions)
+     Body: { messages, tools, stream, response_format, temperature, ... }
+     Response: { choices: [{ message: { content: "..." } }], usage }
+
+   - **OpenAI Responses API** (GPT 5.4, GPT 5.5, GPT Codex):
+     POST /codex/v1/responses
+     Body: { model, input, tools, reasoning, stream }
+     Response: { output: [{type: "message", content: [{text: ...}]}],
+                 usage, credits_consumed, status: "completed" }
+
+   - **Anthropic Messages** (Claude Opus 4.5-4.8, Sonnet 4.5-4.6, Haiku 4.5):
+     POST /claude/v1/messages
+     Body: { model, messages, tools, stream, thinking }
+     Response: { id, content: [{type: "text", text: "..."}], usage }
+
+   All three are SYNCHRONOUS: one POST → response in 1-30s. Use
+   ``chat_completion()`` which handles all three shapes via the
+   endpoint argument.
 
 For the Gemini Omni helper endpoints (audio/character creation), see
 ``create_omni_resource`` — these are synchronous and return immediately.
@@ -1079,6 +1103,63 @@ class KieClient:
             timeout=timeout,
             progress_callback=progress_callback,
         )
+
+    # ================================================== CHAT/LLM (synchronous)
+    #
+    # Unlike all other patterns above, chat completions are SYNCHRONOUS:
+    # one POST returns the model's response directly (1-30s). No taskId,
+    # no polling. The endpoint and body shape differ by family:
+    #
+    #   OpenAI Chat Completions:  /<model>/v1/chat/completions
+    #   OpenAI Responses API:     /codex/v1/responses
+    #   Anthropic Messages:       /claude/v1/messages
+    #
+    # Auth (Authorization: Bearer ...) is handled uniformly by ``_request()``.
+    # Anthropic-specific headers (X-Api-Key, anthropic-version) are managed
+    # by Kie.ai's gateway internally — per docs, don't add them as request
+    # params.
+
+    # Increase HTTP timeout for chat (longer streams + reasoning can take 60s+)
+    _CHAT_TIMEOUT_SECONDS = 120.0
+
+    def chat_completion(
+        self,
+        endpoint: str,
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Make a synchronous chat-completion call.
+
+        Args:
+            endpoint: e.g. "/gpt-5-2/v1/chat/completions", "/codex/v1/responses",
+                "/claude/v1/messages".
+            body: full request body (already formatted for the target shape).
+
+        Returns:
+            The full response payload (parsed JSON). Caller is responsible
+            for extracting text from the right field per family:
+            - OpenAI Chat: ``choices[0].message.content``
+            - Responses:    ``output[].content[].text`` (first "message" type)
+            - Anthropic:    ``content[].text`` (first "text" type)
+
+        Uses a longer per-request timeout (default 120s) because reasoning
+        models like GPT 5.5 and Claude Opus with thinking can take 60+ s.
+        """
+        log.debug("Kie chat_completion endpoint=%s", endpoint)
+        # Pass timeout as a per-request override — httpx supports this kwarg
+        # on .request() and it shadows the client-level default for this call.
+        payload = self._request(
+            "POST",
+            endpoint,
+            json=body,
+            timeout=httpx.Timeout(self._CHAT_TIMEOUT_SECONDS),
+        )
+
+        # Chat responses don't follow the standard {code, msg, data} envelope —
+        # they return the model's response shape directly. ``_request()``
+        # tolerates this because ``inner_code = payload.get("code")`` will be
+        # None for chat responses, which short-circuits the error check.
+        # Just return the raw payload; the caller knows its expected shape.
+        return payload if isinstance(payload, dict) else {}
 
     # ---------------------------------------------------------- account utils
 
