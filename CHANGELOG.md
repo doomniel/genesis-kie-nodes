@@ -1,140 +1,136 @@
 # Changelog
 
-All notable changes to `genesis-kie-nodes` are documented here.
+All notable changes to **genesis-kie-nodes** will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.3.0] — 2026-06-06
+---
 
-### Added — Complete Kie.ai video catalog (58 → 70 nodes)
+## [Unreleased]
 
-**Runway dedicated API (+3, new module `nodes/video/runway.py`)**
-- Runway Gen-4 Turbo (`POST /api/v1/runway/generate`)
-- Runway Extend (`POST /api/v1/runway/extend`) — only 720p sources extendable per docs
-- Runway Aleph V2V editing (`POST /api/v1/aleph/generate`) — 5s output cap
-- `KieClient.run_runway(path, body)` for the dedicated pattern: camelCase
-  body, no `input` wrapper, polled via `/runway/record-detail`, result
-  extracted from `data.videoInfo.videoUrl`.
+### Planned for v0.7.0
+- Music Video Generation (Suno-related)
+- Sounds Generation endpoint
+- Gemini Omni Character (multimodal)
 
-**Sora 2 extras (+4)**
-- Sora Watermark Remover (model `sora-watermark-remover`, ~$0.05/video).
-  Only accepts Sora.com URLs starting with `sora.chatgpt.com`.
-- Sora 2 Characters (create reusable character from a video clip).
-- Sora 2 Characters Pro (extract character from a prior task at given timestamps).
-- Sora 2 Pro Storyboard (multi-scene up to 25s). **Body schema inferred**
-  from product page description — module docstring documents this and
-  points to docs.kie.ai for canonical spec when published.
+### Planned for v0.8.0+
+- Example `.json` workflows
+- `KieCreditsCheck` node (balance preview)
+- Production deploy guide for GenesisLab
 
-**Sora 2 Pro corrections**
-- Added required `size` parameter: `"standard"` (720p, $0.45/10s) or `"high"`
-  (1080p HD, $1.00/10s). Previously missing from batch 2.
-- `n_frames` now supports `"10"` or `"15"` (Pro tier).
+---
 
-**HappyHorse 1.0 family completed (+2)**
-- Reference-to-Video (1-9 reference images, uses `character1`/`character2`
-  conventions in prompt for ordered referencing).
-- Video Edit (V2V with `audio_setting`: `"auto"` or `"origin"`, optional
-  0-5 reference images).
+## [0.6.0] — 2026-06-07
 
-**Gemini Omni multimodal (+3, new module `nodes/video/gemini_omni.py`)**
-- Gemini Omni Video (model `gemini-omni-video`) — multimodal with slot
-  budget: 7 total slots (image=1, video=2, character=1), audio=1 separate.
-- Gemini Omni Audio create (`POST /api/v1/omni/audio/create`, synchronous,
-  returns `kieAudioId`).
-- Gemini Omni Character create (`POST /api/v1/omni/character/create`,
-  synchronous, returns `kieCharacterId`). **Path inferred** from audio
-  endpoint pattern.
-- `KieClient.create_omni_audio()` + `create_omni_character()` for the
-  sync helper endpoints.
+### Added
+- **17 LLM / Chat nodes** across 4 families × 3 endpoint sub-patterns:
+  - **GPT (3):** GPT 5.2 (Chat Completions), GPT 5.4 + 5.5 (Responses API)
+  - **Claude (7):** Opus 4.5/4.6/4.7/4.8, Sonnet 4.5/4.6, Haiku 4.5
+  - **Codex (1):** GPT Codex with version dropdown (5 variants: 5/5.1/5.2/5.3/5.4-codex)
+  - **Gemini (6):** 2.5 Pro/Flash, 3 Pro/Flash, 3.1 Pro, 3.5 Flash (all OpenAI-compat)
+- **7th endpoint pattern** in `KieClient`: `chat_completion()` (first synchronous endpoint — no taskId, no polling, 120s timeout).
+- **4 new base classes** in `nodes/base.py`:
+  - `BaseKieChatNode` (abstract)
+  - `BaseKieChatOpenAINode` (OpenAI Chat Completions shape)
+  - `BaseKieChatResponsesNode` (Responses API + adjustable `reasoning_effort`)
+  - `BaseKieChatAnthropicNode` (Anthropic Messages + optional `thinking` blocks)
+- **Multimodal input** (`image_url`) for all 17 LLM nodes that support vision.
+- Professional outputs: `(text, tokens_used)` — built-in cost tracking.
+- `smoke_phase5.py` and `debug_codex.py` test runners.
 
-### Changed
-- `KieClient`: refactored to support three endpoint patterns explicitly
-  (Market generic, Veo dedicated, Runway dedicated) plus the sync Omni
-  helpers. Documented in the module docstring.
-- `_OK_CODES` extended from `{200}` to `{0, 200}` — Gemini Omni Audio
-  returns `code: 0` for success (not 200).
-- `nodes/video/__init__.py` aggregates 11 sub-modules (was 9), adding
-  `runway` and `gemini_omni`.
-- `nodes/video/happyhorse.py` rewrites with all 4 modes (T2V/I2V/R2V/Edit)
-  using the correct `happyhorse/*` endpoint slugs.
-- `nodes/video/sora.py` expands from 4 to 8 classes; Pro tier now uses
-  separate `_SoraProBase` with the `size` selector.
+### Fixed
+- **Codex `max_output_tokens` 500 bug**: removed `max_output_tokens` from Responses API body. Kie.ai's gateway returns `{"code":500,"msg":"Server exception"}` when this field is present on the `/api/v1/responses` endpoint. GPT 5.5 tolerated it on its different endpoint, but the field is non-standard in the Responses API spec anyway. Verified via 3-variant debug script.
+- **Gemini "model not supported" 422 bug**: `_GeminiChatBase` now strips `model` from the request body. Kie's Gemini gateway rejects bodies containing it because the endpoint path already identifies the model. GPT and Claude bases still include `model` as expected.
 
-### Validated
-- All 70 nodes import cleanly into a fresh ComfyUI install.
-- Distribution by family: Wan 16 · Kling 14 · Sora 2 8 · Bytedance 8 ·
-  Hailuo 5 · Grok 4 · HappyHorse 4 · Veo 3 · Runway 3 · Gemini Omni 3 ·
-  Topaz 1 · Infinitalk 1.
+### Total
+- **150 nodes** across 4 modalities and 7 endpoint patterns.
 
-### Known caveats
-- **Sora 2 Pro Storyboard**: request body uses `scenes: [{duration, prompt,
-  reference_image_url?}]` array — inferred from product page since the
-  OpenAPI spec was not exposed in `docs.kie.ai/.md` form at release time.
-  Will be updated once canonical spec is available.
-- **Gemini Omni Character**: request path (`/api/v1/omni/character/create`)
-  and body shape (`character_id`, `name`, `character_description`,
-  `image_urls`) inferred from audio endpoint pattern. Will be updated once
-  docs expose the canonical spec.
+---
 
-## [0.2.0] — 2026-06-06 (earlier same day)
+## [0.5.0] — 2026-06-07
 
-### Added — Full video catalog (15 → 58 nodes)
+### Added
+- **20 music / audio nodes** across 2 families × 3 endpoint sub-patterns:
+  - **ElevenLabs (Market, 4):** Audio Isolation, TTS Multilingual v2, TTS Turbo 2.5, Text-to-Dialogue v3
+  - **Suno Music Generation (Dedicated, 11):** Generate, Extend, UploadAndCover, UploadAndExtend, MusicCover, AddInstrumental, AddVocals, BoostStyle, ReplaceSection, GeneratePersona, Mashup
+  - **Suno Utilities (Dedicated, 5):** GenerateLyrics, TimestampedLyrics (synchronous), ConvertToWAV, VocalRemoval (stem separation), GenerateMIDI
+- **6th endpoint pattern** in `KieClient`: `run_suno_task()` for Suno's dedicated endpoints (string-based status enum: SUCCESS, *_FAILED variants).
+- **4 new base classes** in `nodes/base.py`:
+  - `BaseKieSunoMusicNode` (3 outputs: `audio_path`, `audio_id`, `all_paths_csv` — `audio_id` enables chaining to Extend/Cover/AddVocals)
+  - `BaseKieSunoTextNode` (text output for lyrics)
+  - `BaseKieSunoAudioUtilityNode` (single audio file output for WAV/MIDI)
+  - `BaseKieSunoStemSeparationNode` (multi-stem output for vocal removal)
+- Auto-injection of `callBackUrl` placeholder when not provided (Suno requires the field even when polling).
 
-**Wan family (16 nodes)**
-- Wan 2.7: T2V, I2V, Video Edit, R2V
-- Wan 2.6: T2V, I2V, V2V
-- Wan 2.6 Flash: I2V, V2V (cheaper tier)
-- Wan 2.5: T2V, I2V
-- Wan 2.2 A14B Turbo: T2V, I2V, Speech-to-Video
-- Wan Animate: Move, Replace
+### Fixed
+- **Lyrics endpoint path**: corrected `/api/v1/lyrics/generate` → `/api/v1/lyrics` (per docs.kie.ai cURL).
+- **Lyrics response extraction**: override `extract_output()` to parse `response.data[].text` array shape (concatenates 2-3 lyric variations with `=== Title ===` markers).
 
-**Kling family completed (14 nodes)**
-- Kling 3.0 single-shot + multi-shot (parses `<duration>:<prompt>` syntax)
-- Motion control: 2.6 + 3.0
-- Kling 2.6: T2V, I2V
-- Kling 2.1: Standard, Pro, Master (T2V + I2V)
-- Kling Avatar: Standard, Pro
+### Total
+- **133 nodes** (70 video + 43 image + 20 music).
 
-**Bytedance family (8 nodes)**
-- Seedance 2.0, Seedance 2.0 Fast (multi-modal)
-- Seedance 1.5 Pro (integer duration, fixed_lens, generate_audio)
-- V1 Pro: T2V, I2V, Fast I2V
-- V1 Lite: T2V, I2V
+---
 
-**Hailuo family (5 nodes)**
-- 02 Pro: T2V, I2V (5000-char prompt, prompt_optimizer)
-- 02 Standard: T2V, I2V (1500-char prompt, optional end_image_url)
-- 2.3 Standard I2V (10s+1080P forbidden per docs)
+## [0.4.0] — 2026-06-07
 
-**Sora 2 family base (4 nodes)**
-- sora-2 T2V/I2V; sora-2-pro T2V/I2V
+### Added
+- **43 image nodes** across 11 families:
+  - Seedream 4.5 (7): T2I, I2I, edit, multi-image variants
+  - Google (7): Imagen, Nano Banana variants
+  - Ideogram 3 (6): T2I, edit, magic prompt
+  - Qwen-Image 2512 (5): T2I, edit
+  - Flux 2.0 (4): dev, schnell, pro, ultra
+  - GPT Image 2.0 (4): variants
+  - Image Utilities (3): Topaz Upscale, BG remove, restore
+  - Wan 2.5 Image (2)
+  - Grok Imagine (2)
+  - GPT 4o Image dedicated (1)
+  - Flux Kontext Pro/Max dedicated (1)
+  - Z-Image Turbo (1)
+- **3 new endpoint patterns** in `KieClient`:
+  - 4th: `run_4o_image()` (GPT 4o Image dedicated, Veo-style polling)
+  - 5th: `run_flux_kontext()` (Flux Kontext dedicated)
+  - Several new utility nodes for image post-processing.
+- Output: `(IMAGE,)` tensor B×H×W×C for direct Save/Preview node compatibility.
 
-**Utility nodes (4)**
-- Topaz Video Upscale (1x/2x/4x)
-- Infinitalk From Audio (lip-sync from portrait + audio)
-- Grok Imagine Upscale, Grok Imagine Extend
+### Fixed
+- Flux Kontext response parsing: handle both `resultUrls` (array) and `resultImageUrl` (singular) shapes.
 
-### Changed
-- `nodes/video/__init__.py` aggregates 9 sub-modules.
-- Mutual-exclusivity rules enforced in every `build_input` (Wan 2.7 I2V
-  sub-modes, Wan 2.7 R2V 5-ref cap, Hailuo 2.3 Std 10s+1080P, Seedance
-  1.5 Pro 2-input cap, Sora 2 character cap).
+### Total
+- **113 nodes** (70 video + 43 image).
 
-## [0.1.0] — 2026-06-06 (initial release)
+---
 
-### Added — Initial release (15 nodes)
-- `client/kie_client.py` v3 with dual-pattern dispatch (`run_market` + `run_veo`).
-- `BaseKieMarketVideoNode`, `BaseKieMarketImageNode`, `BaseKieMarketAudioNode`,
-  `BaseKieMarketTextNode`, `BaseKieVeoVideoNode` in `nodes/base.py`.
-- Veo 3.1 (3 nodes): Quality, Fast, Lite.
-- Kling 2.5 Turbo Pro: T2V, I2V.
-- Bytedance Seedance 2.0 + Seedance 2.0 Fast (expanded in v0.2.0).
-- Hailuo 2.3 Pro T2V + I2V (renamed in v0.2.0).
-- HappyHorse 1.0: T2V, I2V (extended to 4 in v0.3.0).
-- Grok Imagine: T2V, I2V.
-- End-to-end smoke tests for Veo 3.1 and Grok (passed at ~$0.20 USD).
+## [0.3.0] — 2026-06-07
 
+### Added
+- **70 video nodes** across 12 families — full coverage of Kie's video Market + dedicated endpoints:
+  - Wan (16): T2V, I2V, image-ref multi for Wan 2.2 A14B and Wan 2.5
+  - Kling (14): 2.5 Pro/Standard with T2V, I2V, lipsync, image-ref variants
+  - Sora (8): Sora 2 / Sora 2 Pro variants (note: API sunset planned Sep 2026)
+  - Bytedance (8): Seedance, Seedance Lite, Seedance Pro
+  - Hailuo (5): Hailuo 02, Hailuo 02 Pro (lipsync, I2V)
+  - HappyHorse (4): First/Last Frame, Multi-image, Lipsync
+  - Grok (4): video variants
+  - Veo dedicated (3): Veo 3, 3.1 Fast, 3.1 Pro
+  - Runway dedicated (3): Gen-4 Turbo, Gen-4 Aleph variants
+  - Gemini (3): video variants
+  - Topaz (1): Video Upscale
+  - Infinitalk (1)
+- **3 endpoint patterns** in `KieClient`:
+  - 1st: `run_market()` (generic `/api/v1/jobs/createTask` for most families)
+  - 2nd: `run_veo()` (Veo dedicated, `successFlag`-based polling)
+  - 3rd: `run_runway()` (Runway dedicated, status-string polling)
+- Frame extraction pipeline: download MP4 → decode → tensor B×H×W×C with fps + frame_count outputs.
+
+### Total
+- **70 video nodes**, baseline release.
+
+---
+
+[Unreleased]: https://github.com/doomniel/genesis-kie-nodes/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/doomniel/genesis-kie-nodes/releases/tag/v0.6.0
+[0.5.0]: https://github.com/doomniel/genesis-kie-nodes/releases/tag/v0.5.0
+[0.4.0]: https://github.com/doomniel/genesis-kie-nodes/releases/tag/v0.4.0
 [0.3.0]: https://github.com/doomniel/genesis-kie-nodes/releases/tag/v0.3.0
-[0.2.0]: https://github.com/doomniel/genesis-kie-nodes/releases/tag/v0.2.0
-[0.1.0]: https://github.com/doomniel/genesis-kie-nodes/releases/tag/v0.1.0

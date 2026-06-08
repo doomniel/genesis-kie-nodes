@@ -1,274 +1,230 @@
-# genesis-kie-nodes
+# Genesis-Kie
 
-**ComfyUI custom nodes for [Kie.ai](https://kie.ai) — 70 video models, one API key.**
+> ComfyUI custom nodes wrapping [Kie.ai](https://kie.ai)'s full multi-modal API surface — **150 nodes** across video, image, music, and LLM, abstracting **7 distinct endpoint patterns** behind a unified node interface.
 
-Production-grade integration of Kie.ai into ComfyUI. Every node maps 1:1 to a real Kie endpoint with parameters extracted verbatim from the upstream OpenAPI specs — **no invented parameters, no fictional defaults**.
-
-Built and maintained by [@doomniel](https://github.com/doomniel) as the unified video provider for [GenesisLab](https://genesislab.top).
-
----
-
-## Why this exists
-
-If you've used Kie.ai before, you know the Market is a goldmine: Veo 3.1, Sora 2, Wan 2.7, Kling 3.0, HappyHorse 1.0, Bytedance Seedance, Hailuo, Runway Gen-4, Gemini Omni, Topaz, Infinitalk — all behind a single API key, with prices typically 30–60% below the official providers. But integrating it into ComfyUI requires:
-
-- Knowing which models exist (the docs sprawl across ~80 endpoints).
-- Knowing each endpoint's quirks (Wan 2.6 uses `image_urls: [url]`, Wan 2.5 uses `image_url: url`, Sora 2 Pro requires `size: standard/high`, Runway uses camelCase without an `input` wrapper, Gemini Omni Audio returns `code: 0` for success…).
-- Knowing the mutual-exclusivity rules (Wan 2.7 I2V has 3 sub-modes that can't be combined, Wan 2.7 R2V caps refs at 5, Hailuo 2.3 Std forbids 10s @ 1080P, Runway 1080p can't be extended, Gemini Omni's 7-slot budget…).
-- Handling THREE distinct task lifecycles (Market `createTask`+`recordInfo`, Veo `veo/generate`+`record-info`, Runway `runway/generate`+`record-detail`).
-
-This package handles all of that.
+[![Tag](https://img.shields.io/github/v/tag/doomniel/genesis-kie-nodes)](https://github.com/doomniel/genesis-kie-nodes/tags)
+[![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 ---
 
-## Catalog (70 nodes)
+## ✨ At a glance
 
-### Video (70)
+|  | Count | Examples |
+|---|---:|---|
+| 🎥 **Video** | 70 nodes | Wan 2.2 A14B, Kling 2.5, Sora 2, Bytedance Seedance, Hailuo, Veo 3.1, Runway Gen-4 Aleph |
+| 🖼️ **Image** | 43 nodes | Flux 2.0, Seedream 4.5, Qwen-Image 2512, Ideogram 3, GPT 4o Image, Flux Kontext, Z-Image Turbo |
+| 🎵 **Music / Audio** | 20 nodes | Suno V5 (11 ops), ElevenLabs TTS + Stem Separation, Lyrics, MIDI, WAV convert |
+| 🤖 **LLM / Chat** | 17 nodes | GPT 5.5, Claude Opus 4.8, Gemini 3.1 Pro, GPT Codex (5 variants) |
 
-| Family | Count | Models |
-|---|---|---|
-| **Wan** | 16 | 2.7 T2V/I2V/Video Edit/R2V · 2.6 T2V/I2V/V2V · 2.6 Flash I2V/V2V · 2.5 T2V/I2V · 2.2 A14B Turbo T2V/I2V/Speech · Animate Move/Replace |
-| **Kling** | 14 | 3.0 single + multi-shot · motion-control 2.6 + 3.0 · 2.6 T2V/I2V · 2.5 Turbo Pro T2V/I2V · 2.1 Std/Pro/Master · Avatar Std/Pro |
-| **Sora 2** | 8 | sora-2 T2V/I2V · sora-2-pro T2V/I2V (size: standard/high) · Watermark Remover · Characters · Characters Pro · Pro Storyboard |
-| **Bytedance** | 8 | Seedance 2.0 · 2.0 Fast · 1.5 Pro · V1 Pro T2V/I2V/Fast I2V · V1 Lite T2V/I2V |
-| **Hailuo** | 5 | 02 Pro T2V/I2V · 02 Standard T2V/I2V · 2.3 Standard I2V |
-| **Grok Imagine** | 4 | T2V · I2V · Upscale · Extend |
-| **HappyHorse 1.0** | 4 | T2V · I2V · Reference-to-Video (1-9 refs) · Video Edit (V2V) |
-| **Veo 3.1** | 3 | Quality · Fast · Lite |
-| **Runway** | 3 | Gen-4 Turbo · Extend · Aleph (V2V) |
-| **Gemini Omni** | 3 | Omni Video (multimodal) · Audio create · Character create |
-| **Topaz** | 1 | Video Upscale (1x/2x/4x) |
-| **Infinitalk** | 1 | Audio → lip-synced video |
-
-Coming next (Phase 3): Image models (~30 nodes — Seedream, Imagen 4, Flux 2, Nano Banana, GPT Image, Topaz Image, Recraft, Ideogram, Qwen, 4o, Flux Kontext, Wan 2.7 Image, Z-Image, Grok Imagine Image).
+**60+ underlying models** from OpenAI, Anthropic, Google, Meta, Black Forest Labs, ElevenLabs, Suno, Runway, ByteDance, Alibaba, Tencent — all behind a single API key.
 
 ---
 
-## Requirements
+## 🚀 Quickstart
 
-- ComfyUI (any recent version)
-- Python 3.10+
-- A Kie.ai API key — get one at <https://kie.ai/api-key>
+### Requirements
 
----
+- Python **3.10+**
+- ComfyUI installation
+- Kie.ai API key — get one at https://kie.ai
 
-## Installation
-
-### Method 1: ComfyUI Manager (recommended once published)
-
-Search `genesis-kie-nodes` in ComfyUI Manager and install.
-
-### Method 2: Git clone
+### Install
 
 ```bash
-cd ComfyUI/custom_nodes
+cd ComfyUI/custom_nodes/
 git clone https://github.com/doomniel/genesis-kie-nodes.git
 cd genesis-kie-nodes
 pip install -r requirements.txt
 ```
 
-### Configuration
+### Configure
 
-Set your API key via one of:
-
-**A. Environment variable** (recommended):
-
-```bash
-export KIE_API_KEY="sk-..."
-```
-
-**B. `.env` file** in the package root:
+Create a `.env` file in `genesis-kie-nodes/`:
 
 ```ini
-KIE_API_KEY=sk-...
+KIE_API_KEY=your-key-here
 ```
 
-The package auto-loads `.env` on import if present.
+### Verify
 
-Restart ComfyUI and look for `Kie — *` nodes in the node browser.
+Restart ComfyUI. Search for `GenesisKie/*` categories in the node browser. You should see Video, Image, Music, and LLM sub-categories with **150 nodes** total.
 
 ---
 
-## Quick start
+## 📚 Catalog by modality
 
-Most nodes follow the same pattern:
+### 🎥 Video (70 nodes, 12 families)
 
-1. Drop the node onto the canvas.
-2. Fill in the prompt and any required URLs.
-3. Connect the `VIDEO` output to a Save Video node (or chain it into further processing).
+| Family | Nodes | Highlights |
+|---|---:|---|
+| Wan | 16 | Wan 2.2 A14B (T2V, I2V, image-ref multi), Wan 2.5 |
+| Kling | 14 | Kling 2.5 Pro/Std (T2V, I2V, lipsync, image-ref) |
+| Sora | 8 | Sora 2 Pro (until sunset Sep 2026), Sora 2 |
+| Bytedance | 8 | Seedance, Seedance Lite, Seedance Pro |
+| Hailuo | 5 | Hailuo 02, Hailuo 02 Pro (lipsync, I2V) |
+| HappyHorse | 4 | First Frame, Last Frame, Multi-image, Lipsync |
+| Grok | 4 | Grok video variants |
+| Veo | 3 | Google Veo 3 / 3.1 Fast / 3.1 Pro (dedicated) |
+| Runway | 3 | Gen-4 Turbo, Gen-4 Aleph (dedicated) |
+| Gemini | 3 | Gemini video variants |
+| Topaz | 1 | Topaz Video Upscale |
+| Infinitalk | 1 | Infinitalk |
 
-The node will:
+### 🖼️ Image (43 nodes, 11 families)
 
-1. Call the appropriate Kie endpoint (Market `createTask`, Veo `veo/generate`, or Runway `runway/generate`).
-2. Poll the matching detail endpoint every few seconds.
-3. Download the result MP4 to ComfyUI's `output/` directory.
-4. Emit the local file path on its `VIDEO` output.
+| Family | Nodes | Highlights |
+|---|---:|---|
+| Seedream | 7 | Seedream 4.5 T2I/I2I, edit, multi-image |
+| Google | 7 | Imagen, Nano Banana variants |
+| Ideogram | 6 | Ideogram 3 T2I, edit, magic prompt |
+| Qwen | 5 | Qwen-Image 2512 (T2I, edit) |
+| Flux-2 | 4 | Flux 2.0 dev, schnell, pro, ultra |
+| GPT Image | 4 | GPT Image 2.0 + variants |
+| Image Utils | 3 | Topaz Upscale, BG remove, restore |
+| Wan Image | 2 | Wan 2.5 image variants |
+| Grok Imagine | 2 | Grok image variants |
+| GPT 4o (dedicated) | 1 | GPT 4o Image (own endpoint) |
+| Flux Kontext (dedicated) | 1 | BFL Flux Kontext Pro/Max |
+| Z-image | 1 | Z-Image Turbo |
 
-### Example: Wan 2.7 text-to-video
+### 🎵 Music / Audio (20 nodes, 2 families)
 
-```
-[Kie — Wan 2.7 (T2V)]
-  prompt: "A drone shot over neon Tokyo at night, slow push-in."
-  resolution: 1080p
-  ratio: 16:9
-  duration: 5
-        ↓
-[Save Video]
-```
+| Family | Nodes | Endpoints |
+|---|---:|---|
+| **ElevenLabs (Market)** | 4 | audio-isolation, TTS-multilingual-v2, TTS-turbo-2.5, text-to-dialogue-v3 |
+| **Suno Music Gen (Dedicated)** | 11 | Generate, Extend, UploadCover, UploadExtend, MusicCover, AddInstrumental, AddVocals, BoostStyle, ReplaceSection, Persona, Mashup |
+| **Suno Utilities (Dedicated)** | 5 | GenerateLyrics, TimestampedLyrics, ConvertToWAV, VocalRemoval, GenerateMIDI |
 
-### Example: Runway Gen-4 Turbo + Extend (chained)
+### 🤖 LLM / Chat (17 nodes, 4 families)
 
-```
-[Kie — Runway Gen-4 Turbo]                    [Kie — Runway Extend]
-  prompt: "A cat dances in a disco room"   →    taskId: <from previous>
-  quality: 720p                            →    prompt: "The cat speeds up"
-  duration: 5                              →    quality: 720p
-```
-
-(Runway 1080p videos can't be extended — the node enforces this.)
-
-### Example: Gemini Omni with reusable voice + character
-
-```
-[Kie — Gemini Omni Audio (create voice)]
-  audio_id: "achernar"
-  name: "narrator_v1"
-  description: "Calm male voice, tech explainers"
-        ↓ kie_audio_id (string)
-        
-[Kie — Gemini Omni Character (create)]
-  character_id: "<template>"
-  image_urls: "https://.../a.png, https://.../b.png"
-        ↓ kie_character_id (string)
-        
-[Kie — Gemini Omni Video]
-  prompt: "A cinematic close-up..."
-  audio_ids: <connected from Audio node>
-  character_ids: <connected from Character node>
-  duration: 8
-```
-
-The slot budget (7 total: image=1, video=2, character=1) is validated **before** spending credits.
+| Family | Nodes | Pattern |
+|---|---:|---|
+| GPT | 3 | GPT 5.2 (chat), GPT 5.4 (responses), GPT 5.5 (responses) |
+| Claude | 7 | Opus 4.5/4.6/4.7/4.8, Sonnet 4.5/4.6, Haiku 4.5 |
+| Codex | 1 | GPT Codex (5 versions via dropdown: 5/5.1/5.2/5.3/5.4-codex) |
+| Gemini | 6 | 2.5 Pro, 2.5 Flash, 3 Pro, 3 Flash, 3.1 Pro, 3.5 Flash |
 
 ---
 
-## Architecture
+## 🔌 Endpoint patterns
 
+Kie.ai exposes **7 distinct API patterns**. This package abstracts all of them behind a single `KieClient` with consistent error handling:
+
+| # | Pattern | Used by | Sync? | Result extraction |
+|---|---|---|---|---|
+| 1 | Market generic | Seedance, Kling, Hailuo, ElevenLabs, ... | Async + polling | `_parsed_result.resultUrls` |
+| 2 | Veo dedicated | Google Veo | Async + polling | `response.resultUrls` (successFlag-based) |
+| 3 | Runway dedicated | Runway Gen-4 | Async + polling | `response.resultUrls` (status-based) |
+| 4 | 4o Image dedicated | GPT 4o Image | Async + polling | `response.resultUrls` |
+| 5 | Flux Kontext dedicated | BFL Flux Kontext | Async + polling | `response.resultUrls` / `resultImageUrl` |
+| 6 | Suno dedicated | Suno + utilities (lyrics, wav, midi, vocal) | Async + polling | `response.sunoData[]` (status enum) |
+| 7 | Chat / LLM | GPT, Claude, Codex, Gemini | **Synchronous** | varies by sub-pattern (3 shapes) |
+
+The 7th pattern itself has 3 sub-shapes:
+- **OpenAI Chat Completions** (GPT 5.2 + all Gemini): `choices[0].message.content`
+- **OpenAI Responses API** (GPT 5.4/5.5 + Codex): `output[].content[].text` + reasoning effort dial
+- **Anthropic Messages** (all Claude): `content[].text` + optional extended thinking
+
+---
+
+## 📤 Output shapes
+
+| Modality | RETURN_TYPES | Why this shape |
+|---|---|---|
+| Video | `(IMAGE, INT, INT)` frames + fps + frame_count | Direct ComfyUI VideoPlayer compatibility |
+| Image | `(IMAGE,)` tensor B×H×W×C | Direct Save/Preview node input |
+| Audio (ElevenLabs) | `(STRING,)` audio_path | Single file, simple downstream |
+| Suno Music | `(STRING, STRING, STRING)` audio_path + audio_id + all_paths_csv | `audio_id` enables Extend/Cover/AddVocals chaining |
+| Suno Lyrics | `(STRING,)` text | Concatenated 2-3 variations |
+| Vocal Removal | `(STRING, STRING, STRING)` vocals + instrumental + all_stems | Multi-stem output |
+| Suno WAV / MIDI | `(STRING,)` file_path | Single converted file |
+| LLM / Chat | `(STRING, INT)` text + tokens_used | Cost tracking built-in |
+
+---
+
+## 🧪 Smoke testing
+
+Each phase ships its own smoke runner. From repo root:
+
+```bash
+# Quick patterns validation (~$0.015)
+python smoke_phase5.py all_cheap   # gemini_flash + claude_haiku + gpt 5.2
+
+# Music validation (~$0.05)
+python smoke_phase4.py lyrics       # Suno lyrics
+python smoke_phase4.py el_tts       # ElevenLabs TTS
+python smoke_phase4.py suno         # Suno Generate Music
+
+# Image validation (~$0.10)
+python smoke_phase3.py kontext_pro  # Flux Kontext
+python smoke_phase3.py gpt4o_image  # GPT 4o Image
+python smoke_phase3.py seedream     # Seedream 4.5
 ```
-genesis-kie-nodes/
-├── __init__.py                    # Registers all node mappings
-├── client/
-│   ├── kie_client.py              # HTTPx-based client (Market + Veo + Runway + Omni)
-│   ├── auth.py                    # Bearer-token auth
-│   ├── exceptions.py              # Typed errors
-│   └── download.py                # Polling + asset download
-├── nodes/
-│   ├── base.py                    # BaseKieMarketVideoNode + base classes
-│   ├── video/
-│   │   ├── veo31.py               # Veo 3.1 (3 nodes — /veo3-api/)
-│   │   ├── kling.py               # Kling family (14 nodes)
-│   │   ├── wan.py                 # Wan family (16 nodes)
-│   │   ├── seedance.py            # Bytedance family (8 nodes)
-│   │   ├── hailuo.py              # Hailuo family (5 nodes)
-│   │   ├── sora.py                # Sora 2 family (8 nodes)
-│   │   ├── happyhorse.py          # HappyHorse 1.0 (4 nodes)
-│   │   ├── grok.py                # Grok Imagine T2V/I2V (2 nodes)
-│   │   ├── runway.py              # Runway Gen-4 + Aleph (3 nodes — dedicated API)
-│   │   ├── gemini_omni.py         # Gemini Omni multimodal (3 nodes — sync helpers)
-│   │   └── utils.py               # Topaz + Infinitalk + Grok Upscale/Extend
-│   ├── image/                     # (Phase 3 — coming)
-│   ├── music/                     # (Phase 4 — coming)
-│   └── llm/                       # (Phase 5 — coming)
-└── tests_local/                   # End-to-end smoke tests
-```
-
-### Three endpoint patterns under one client
-
-`KieClient` handles three distinct Kie endpoint patterns transparently:
-
-1. **Market generic** (`run_market`) — covers ~80% of nodes. `POST /api/v1/jobs/createTask` with `{model, input: {...}}`, poll `GET /api/v1/jobs/recordInfo`.
-
-2. **Veo dedicated** (`run_veo`) — for Veo 3.1. `POST /api/v1/veo/generate` with parameters at the top level (no `input` wrapper), poll `GET /api/v1/veo/record-info`. Status lives in `successFlag` (0/1/2/3) not in `state`.
-
-3. **Runway dedicated** (`run_runway`) — for Runway Gen-4 + Aleph. Uses `POST /api/v1/runway/generate` (or `/extend`, `/aleph/generate`) with camelCase parameters at the top level. Polls `GET /api/v1/runway/record-detail`. Result lives in `data.videoInfo.videoUrl` (not `resultJson`).
-
-Plus two synchronous helper endpoints for Gemini Omni:
-
-- `POST /api/v1/omni/audio/create` — voice creation, returns `kieAudioId` immediately.
-- `POST /api/v1/omni/character/create` — character creation, returns `kieCharacterId` immediately. *(Note: body schema inferred from audio endpoint pattern; will be confirmed against canonical spec when docs.kie.ai exposes it.)*
-
-### `BaseKieMarketVideoNode`
-
-All Market-pattern video nodes inherit from `BaseKieMarketVideoNode`, which provides:
-
-- `MODEL: ClassVar[str]` — the Kie endpoint slug
-- `POLL_INTERVAL_SECONDS` / `TIMEOUT_SECONDS` — per-model defaults
-- `RETURN_TYPES = ("VIDEO",)`
-- `FUNCTION = "execute"`
-- `execute()` — the universal lifecycle (build → submit → poll → download → return)
-
-Subclasses only implement:
-
-- `INPUT_TYPES()` — UI definition with the node's specific parameters
-- `build_input(**kwargs) -> dict` — translates UI inputs into the Kie API body, **with input validation**
-
-Runway nodes use `_BaseRunwayNode` instead (similar shape but builds camelCase bodies and uses `KieClient.run_runway`).
 
 ---
 
-## A note on parameter fidelity
+## 💰 Cost gotchas
 
-Every parameter, enum, default, and constraint in this package came from the **`.md` versions** of `docs.kie.ai` endpoints, which expose the raw OpenAPI specs.
+Approximate baselines (rates vary, check kie.ai pricing):
 
-Where the OpenAPI omits or contradicts itself (e.g. Sora 2 Pro Storyboard's body schema, Gemini Omni Character's request path), the cURL examples in the docs were used as ground truth and clearly marked as **inferred** in the module docstring. The exact source for each family is documented in that file.
+| Family | Baseline | Notes |
+|---|---:|---|
+| Suno Lyrics | $0.01 | Returns 2-3 lyric variations |
+| Gemini 3.5 Flash | $0.003 | Cheapest LLM in the catalog |
+| Claude Haiku 4.5 | $0.005 | Fast tier |
+| GPT 5.2 | $0.005 | Cheap GPT baseline |
+| ElevenLabs TTS | $0.02 | Per ~200 chars |
+| Suno Generate Music | $0.04 | Returns 2 audio variants |
+| Gemini 3.1 Pro | $0.02 | Frontier reasoning |
+| GPT 5.5 (reasoning) | $0.04 | Responses API |
+| Claude Opus 4.8 | $0.05 | Frontier coding/writing |
+| **GPT Codex** | **$0.37 baseline ⚠️** | Codex injects ~2500-token system prompt regardless of your input |
+| Suno Persona / WAV / MIDI | varies | Often free post-generation |
+| Veo / Runway video | $0.50-$2.00 | Premium tier |
 
-If you spot a parameter that doesn't behave as documented in this repo: please open an issue with the exact docs URL and the upstream cURL example. **I will not add parameters that aren't in the upstream specs.**
-
----
-
-## Roadmap
-
-- [x] **v0.1.0** — Batch 1: Veo 3.1 + first nodes (15 total)
-- [x] **v0.2.0** — Batch 2: full video catalog minus Runway/Omni (58 total)
-- [x] **v0.3.0** — Batch 3: complete video catalog (70 total) ← **you are here**
-- [ ] **v0.4.0** — Image models (~30 nodes: Seedream, Imagen 4, Flux 2, Nano Banana, GPT Image, Topaz Image, Recraft, Ideogram, Qwen, 4o, Flux Kontext, Wan 2.7 Image, Z-Image, Grok Imagine Image)
-- [ ] **v0.5.0** — Music models (Suno API + ElevenLabs)
-- [ ] **v0.6.0** — Chat models (Claude, GPT, Gemini, Codex)
-- [ ] **v1.0.0** — GenesisLab integration (kie.genesislab.top, multi-tenant billing)
-
----
-
-## Pricing reality check
-
-Kie.ai consolidates these providers. As of June 2026, the headline savings vs official APIs:
-
-| Model | Official | via Kie | Savings |
-|---|---|---|---|
-| Sora 2 std (10s, 720p) | $1.00 | $0.15 | ~85% |
-| Sora 2 Pro HD (10s, 1080p) | $2.00 | $1.00 | ~50% |
-| Runway Gen-4 Turbo (10s, 720p) | $0.50 | varies | varies |
-| Veo 3.1 Quality (8s, 1080p) | varies | competitive | varies |
-| HappyHorse 1.0 (5s, 720p) | $0.625 | varies | varies |
-| Kling 3.0 (5s, 1080p) | $1.40 | ~$0.55 | ~60% |
-
-Prices fluctuate. Use **`Common API → Get Account Credits`** to check live cost-per-call before launching production runs.
+For real-time balance checks before workflow run, see the planned `KieCreditsCheck` node in [Roadmap](#roadmap).
 
 ---
 
-## License
+## 🗺️ Roadmap
 
-MIT — see `LICENSE`.
-
----
-
-## Acknowledgments
-
-- [Kie.ai](https://kie.ai) for aggregating an absurd number of frontier video models behind one API.
-- The ComfyUI community for the node interface standard.
-- Anthropic Claude for pair-coding the bulk of this catalog (literally — go look at the commit messages).
+- [ ] **v0.7.0** — Music Video Generation + Sounds Generation + Gemini Omni Character (~5-8 nodes)
+- [ ] **v0.8.0** — Example `.json` workflows demonstrating common pipelines
+- [ ] **v0.9.0** — `KieCreditsCheck` node (balance preview before workflow execution)
+- [ ] **v1.0.0** — Production deploy guide + GenesisLab multi-tenant integration
 
 ---
 
-## Author
+## 📋 Changelog
 
-**[@doomniel](https://github.com/doomniel)** — Damniel, transmedia designer & creative technologist building [GenesisLab](https://genesislab.top) (multi-tenant ComfyUI SaaS on Proxmox). Based in CDMX, available for collaborations: [Mojo Supermarket](https://mojosupermarket.com), Havas, etc.
+See [CHANGELOG.md](CHANGELOG.md) for the full version history.
+
+Recent releases:
+- **v0.6.0** — 17 LLM nodes (GPT, Claude, Codex, Gemini) + 7th endpoint pattern
+- **v0.5.0** — 20 music nodes (ElevenLabs + Suno) + 6th endpoint pattern
+- **v0.4.0** — 43 image nodes across 11 families
+- **v0.3.0** — 70 video nodes, full Kie Market coverage
+
+---
+
+## 🤝 Contributing
+
+PRs welcome. When adding new Kie.ai endpoints:
+
+1. Add the API spec to the relevant `nodes/<modality>/` file
+2. Reuse one of the existing base classes (`BaseKieMarketVideoNode`, `BaseKieChatNode`, etc) or extend `BaseKieNode` if it's a new pattern
+3. Smoke-test against a real Kie.ai call before opening the PR
+4. Update the catalog table in `README.md`
+
+---
+
+## 📄 License
+
+MIT — see [LICENSE](LICENSE).
+
+---
+
+## 👤 Author
+
+Built by [@doomniel](https://github.com/doomniel) as the API layer for [GenesisLab](https://genesislab.app), a multi-tenant ComfyUI SaaS platform.
