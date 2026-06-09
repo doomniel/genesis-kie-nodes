@@ -1,24 +1,7 @@
-"""Wan 2.7 Image generation nodes (via Kie.ai).
+"""Wan 2.7 Image generation nodes (via GenesisLab proxy / Kie.ai).
 
-Alibaba Wan 2.7 unified image model — supports text-to-image and image
-editing in a single endpoint. The Pro tier uses the same schema with
-better fidelity.
-
-Covers the 2 Wan Image endpoints:
-
-- wan/2-7-image       (standard tier)
-- wan/2-7-image-pro   (pro tier)
-
-Per docs.kie.ai cURL — both endpoints share an identical body schema:
-- prompt: text instruction
-- input_urls: optional reference images (when present, becomes I2I/edit)
-- n: number of images to generate (1-4)
-- enable_sequential: generate as a sequence (for storyboards/sets)
-- resolution: "2K" (only documented value)
-- thinking_mode: enable reasoning step for complex prompts
-- watermark: include Kie watermark in output
-- seed: deterministic seed (0 = random)
-- bbox_list: bounding boxes for region-specific edits (per input image)
+Alibaba Wan 2.7 unified image model — supports T2I and I2I in a single endpoint.
+Accepts an optional IMAGE input (possibly batched) for I2I/edit mode.
 """
 
 from __future__ import annotations
@@ -26,22 +9,23 @@ from __future__ import annotations
 from typing import Any, ClassVar
 
 from ..base import BaseKieMarketImageNode
+from ...client.upload import upload_image_tensor
 
 
 _WAN_RESOLUTIONS = ["2K"]
 
 
-def _csv(value: str) -> list[str]:
-    if not value:
+def _upload_batch_optional(image_tensor: Any) -> list[str]:
+    if image_tensor is None:
         return []
-    return [s.strip() for s in value.split(",") if s.strip()]
+    if not hasattr(image_tensor, "shape"):
+        return []
+    n = image_tensor.shape[0] if len(image_tensor.shape) >= 4 else 1
+    return [upload_image_tensor(image_tensor[i:i + 1]) for i in range(n)]
 
 
 class _WanImageBase(BaseKieMarketImageNode):
-    """Shared scaffolding for Wan 2.7 Image (standard + pro).
-
-    Both tiers use identical params; subclasses only set ``MODEL``.
-    """
+    """Shared scaffolding for Wan 2.7 Image (standard + pro)."""
 
     POLL_INTERVAL_SECONDS = 3.0
     TIMEOUT_SECONDS = 600.0
@@ -57,25 +41,15 @@ class _WanImageBase(BaseKieMarketImageNode):
                         "ingredients with sliced red chili pieces."
                     ),
                 }),
-                "n": ("INT", {
-                    "default": 1, "min": 1, "max": 4,
-                    "tooltip": "Number of images to generate (1-4).",
-                }),
+                "n": ("INT", {"default": 1, "min": 1, "max": 4}),
                 "resolution": (_WAN_RESOLUTIONS, {"default": "2K"}),
             },
             "optional": {
-                "input_urls": ("STRING", {
-                    "default": "",
-                    "tooltip": "Comma-separated reference image URLs (optional, makes I2I).",
+                "input_images": ("IMAGE", {
+                    "tooltip": "Optional reference image(s). Connect a batch for multi-ref.",
                 }),
-                "enable_sequential": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Generate images as a coherent sequence (e.g. for storyboards).",
-                }),
-                "thinking_mode": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Enable reasoning step for complex prompts (higher cost).",
-                }),
+                "enable_sequential": ("BOOLEAN", {"default": False}),
+                "thinking_mode": ("BOOLEAN", {"default": False}),
                 "watermark": ("BOOLEAN", {"default": False}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 2**31 - 1}),
             },
@@ -91,23 +65,19 @@ class _WanImageBase(BaseKieMarketImageNode):
             "watermark": bool(kwargs.get("watermark", False)),
             "seed": int(kwargs.get("seed") or 0),
         }
-        imgs = _csv((kwargs.get("input_urls") or "").strip())
-        if imgs:
-            body["input_urls"] = imgs
+        urls = _upload_batch_optional(kwargs.get("input_images"))
+        if urls:
+            body["input_urls"] = urls
         return body
 
 
 class Wan27Image(_WanImageBase):
-    """Wan 2.7 Image (standard tier — text-to-image and image edit unified)."""
     MODEL = "wan/2-7-image"
 
 
 class Wan27ImagePro(_WanImageBase):
-    """Wan 2.7 Image Pro (premium tier — higher fidelity)."""
     MODEL = "wan/2-7-image-pro"
 
-
-# ----------------------------------------------------------------- Registration
 
 NODE_CLASS_MAPPINGS: dict[str, type] = {
     "GenesisKieWan27Image": Wan27Image,
@@ -115,6 +85,6 @@ NODE_CLASS_MAPPINGS: dict[str, type] = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS: dict[str, str] = {
-    "GenesisKieWan27Image": "Kie — Wan 2.7 Image",
-    "GenesisKieWan27ImagePro": "Kie — Wan 2.7 Image Pro",
+    "GenesisKieWan27Image": "Wan 2.7 Image",
+    "GenesisKieWan27ImagePro": "Wan 2.7 Image Pro",
 }

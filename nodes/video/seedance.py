@@ -1,33 +1,11 @@
-"""ByteDance video generation nodes (complete family).
-
-Covers all 8 Bytedance endpoints in Kie.ai:
-
-Seedance 2.x:
-  - Seedance 2.0           (bytedance/seedance-2)
-  - Seedance 2.0 Fast      (bytedance/seedance-2-fast)
-
-Seedance 1.5:
-  - Seedance 1.5 Pro       (bytedance/seedance-1.5-pro)
-
-V1 Pro:
-  - V1 Pro Text-to-Video        (bytedance/v1-pro-text-to-video)
-  - V1 Pro Image-to-Video       (bytedance/v1-pro-image-to-video)
-  - V1 Pro Fast Image-to-Video  (bytedance/v1-pro-fast-image-to-video)
-
-V1 Lite:
-  - V1 Lite Text-to-Video       (bytedance/v1-lite-text-to-video)
-  - V1 Lite Image-to-Video      (bytedance/v1-lite-image-to-video)
-
-All use the Market endpoint /api/v1/jobs/createTask.
-
-Parameter schemas extracted verbatim from docs.kie.ai OpenAPI specs.
-"""
+"""ByteDance video generation nodes (complete family). 8 nodes."""
 
 from __future__ import annotations
 
 from typing import Any, ClassVar
 
 from ..base import BaseKieMarketVideoNode
+from ...client.upload import upload_image_tensor, upload_video_frames, upload_audio
 
 
 _RATIOS_SEEDANCE = ["16:9", "9:16", "1:1"]
@@ -35,14 +13,32 @@ _RATIOS_V1 = ["21:9", "16:9", "4:3", "1:1", "3:4", "9:16"]
 _RATIOS_V1_LITE = ["16:9", "4:3", "1:1", "3:4", "9:16", "9:21"]
 
 
+def _upload_first(image_tensor: Any) -> str:
+    if image_tensor is None or not hasattr(image_tensor, "shape"):
+        raise ValueError("image tensor required")
+    return upload_image_tensor(image_tensor[0:1])
+
+
+def _upload_first_optional(image_tensor: Any) -> str | None:
+    if image_tensor is None:
+        return None
+    return upload_image_tensor(image_tensor[0:1])
+
+
+def _upload_batch_optional(image_tensor: Any) -> list[str]:
+    if image_tensor is None:
+        return []
+    n = image_tensor.shape[0] if len(image_tensor.shape) >= 4 else 1
+    return [upload_image_tensor(image_tensor[i:i + 1]) for i in range(n)]
+
+
 # ============================================================ Seedance 2.x
 
 class _Seedance2Base(BaseKieMarketVideoNode):
-    """Shared scaffolding for Seedance 2.0 tiers.
+    """Seedance 2.0 base. Multiple modes via optional inputs.
 
-    All Seedance modes (t2v, i2v, transition, multimodal reference) live
-    in the same endpoint — the mode is determined by which optional
-    inputs are set.
+    Note: reference_video accepts a single video (IMAGE batch). For multiple
+    ref videos, use external URLs (not currently supported by this node).
     """
 
     POLL_INTERVAL_SECONDS = 5.0
@@ -53,21 +49,19 @@ class _Seedance2Base(BaseKieMarketVideoNode):
     def INPUT_TYPES(cls) -> dict[str, Any]:
         return {
             "required": {
-                "prompt": ("STRING", {
-                    "multiline": True,
-                    "default": "A serene beach at sunset with waves.",
-                }),
+                "prompt": ("STRING", {"multiline": True, "default": "A serene beach at sunset with waves."}),
                 "resolution": (cls.SUPPORTED_RESOLUTIONS, {"default": "720p"}),
                 "aspect_ratio": (_RATIOS_SEEDANCE, {"default": "16:9"}),
                 "duration": ("INT", {"default": 5, "min": 3, "max": 15, "step": 1}),
                 "generate_audio": ("BOOLEAN", {"default": False}),
             },
             "optional": {
-                "first_frame_url": ("STRING", {"default": "", "tooltip": "Image-to-video mode."}),
-                "last_frame_url": ("STRING", {"default": "", "tooltip": "Transition mode (requires first_frame)."}),
-                "reference_image_urls": ("STRING", {"default": "", "tooltip": "Comma-separated reference images."}),
-                "reference_video_urls": ("STRING", {"default": "", "tooltip": "Comma-separated reference videos."}),
-                "reference_audio_urls": ("STRING", {"default": "", "tooltip": "Comma-separated reference audio."}),
+                "first_frame": ("IMAGE", {"tooltip": "First-frame image (I2V mode)."}),
+                "last_frame": ("IMAGE", {"tooltip": "Last-frame image (transition mode, requires first_frame)."}),
+                "reference_images": ("IMAGE", {"tooltip": "Reference image(s). Batch for multi-ref."}),
+                "reference_video": ("IMAGE", {"tooltip": "Single reference video as IMAGE batch."}),
+                "reference_audio": ("AUDIO", {"tooltip": "Reference audio."}),
+                "fps": ("INT", {"default": 24, "min": 8, "max": 60, "step": 1}),
                 "return_last_frame": ("BOOLEAN", {"default": False}),
                 "web_search": ("BOOLEAN", {"default": False}),
             },
@@ -83,42 +77,41 @@ class _Seedance2Base(BaseKieMarketVideoNode):
             "return_last_frame": bool(kwargs.get("return_last_frame", False)),
             "web_search": bool(kwargs.get("web_search", False)),
         }
-        first = (kwargs.get("first_frame_url") or "").strip()
-        last = (kwargs.get("last_frame_url") or "").strip()
-        ref_i = self._csv((kwargs.get("reference_image_urls") or "").strip())
-        ref_v = self._csv((kwargs.get("reference_video_urls") or "").strip())
-        ref_a = self._csv((kwargs.get("reference_audio_urls") or "").strip())
+        first = kwargs.get("first_frame")
+        last = kwargs.get("last_frame")
+        ref_i = kwargs.get("reference_images")
+        ref_v = kwargs.get("reference_video")
+        ref_a = kwargs.get("reference_audio")
 
-        if (first or last) and (ref_i or ref_v or ref_a):
-            raise ValueError("Seedance: first/last frame mode and reference mode are mutually exclusive.")
+        has_frame_mode = first is not None or last is not None
+        has_ref_mode = ref_i is not None or ref_v is not None or ref_a is not None
 
-        if first:
-            body["first_frame_url"] = first
-        if last:
-            body["last_frame_url"] = last
-        if ref_i:
-            body["reference_image_urls"] = ref_i
-        if ref_v:
-            body["reference_video_urls"] = ref_v
-        if ref_a:
-            body["reference_audio_urls"] = ref_a
+        if has_frame_mode and has_ref_mode:
+            raise ValueError("Seedance: frame mode and reference mode are mutually exclusive.")
+
+        if first is not None:
+            body["first_frame_url"] = _upload_first(first)
+        if last is not None:
+            body["last_frame_url"] = _upload_first(last)
+
+        ref_img_urls = _upload_batch_optional(ref_i)
+        if ref_img_urls:
+            body["reference_image_urls"] = ref_img_urls
+        if ref_v is not None:
+            fps = int(kwargs.get("fps", 24))
+            body["reference_video_urls"] = [upload_video_frames(ref_v, fps=fps)]
+        if ref_a is not None:
+            body["reference_audio_urls"] = [upload_audio(ref_a)]
+
         return body
-
-    @staticmethod
-    def _csv(value: str) -> list[str]:
-        if not value:
-            return []
-        return [s.strip() for s in value.split(",") if s.strip()]
 
 
 class Seedance20(_Seedance2Base):
-    """ByteDance Seedance 2.0 — full quality, up to 1080p."""
     MODEL = "bytedance/seedance-2"
     SUPPORTED_RESOLUTIONS = ["480p", "720p", "1080p"]
 
 
 class Seedance20Fast(_Seedance2Base):
-    """ByteDance Seedance 2.0 Fast — cheaper, up to 720p."""
     MODEL = "bytedance/seedance-2-fast"
     SUPPORTED_RESOLUTIONS = ["480p", "720p"]
 
@@ -126,15 +119,7 @@ class Seedance20Fast(_Seedance2Base):
 # ============================================================ Seedance 1.5 Pro
 
 class Seedance15Pro(BaseKieMarketVideoNode):
-    """ByteDance Seedance 1.5 Pro.
-
-    Different parameter shape from Seedance 2.x:
-    - ``input_urls`` (array, 0-2 images, optional — text-to-video if empty)
-    - ``aspect_ratio`` required (1:1 / 4:3 / 3:4 / 16:9 / 9:16 / 21:9)
-    - ``duration``: 4 / 8 / 12 (integer, not free range)
-    - ``fixed_lens``: lock camera for static shots
-    - ``generate_audio``: optional audio (higher cost)
-    """
+    """Seedance 1.5 Pro — input_urls accepts 0-2 images."""
 
     MODEL = "bytedance/seedance-1.5-pro"
     POLL_INTERVAL_SECONDS = 5.0
@@ -144,27 +129,15 @@ class Seedance15Pro(BaseKieMarketVideoNode):
     def INPUT_TYPES(cls) -> dict[str, Any]:
         return {
             "required": {
-                "prompt": ("STRING", {
-                    "multiline": True,
-                    "default": "A serene beach at sunset.",
-                }),
+                "prompt": ("STRING", {"multiline": True, "default": "A serene beach at sunset."}),
                 "aspect_ratio": (["1:1", "4:3", "3:4", "16:9", "9:16", "21:9"], {"default": "16:9"}),
                 "resolution": (["480p", "720p", "1080p"], {"default": "720p"}),
                 "duration": ([4, 8, 12], {"default": 8}),
             },
             "optional": {
-                "input_urls": ("STRING", {
-                    "default": "",
-                    "tooltip": "Comma-separated input image URLs (0-2). Empty = text-to-video.",
-                }),
-                "fixed_lens": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Lock camera for stable, static shots.",
-                }),
-                "generate_audio": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Generate audio (higher cost).",
-                }),
+                "input_images": ("IMAGE", {"tooltip": "Optional input image(s). Batch for 2 max. Empty = T2V."}),
+                "fixed_lens": ("BOOLEAN", {"default": False}),
+                "generate_audio": ("BOOLEAN", {"default": False}),
             },
         }
 
@@ -177,25 +150,17 @@ class Seedance15Pro(BaseKieMarketVideoNode):
             "fixed_lens": bool(kwargs.get("fixed_lens", False)),
             "generate_audio": bool(kwargs.get("generate_audio", False)),
         }
-        inputs = self._csv((kwargs.get("input_urls") or "").strip())
-        if len(inputs) > 2:
-            raise ValueError(f"Seedance 1.5 Pro: max 2 input images, got {len(inputs)}.")
-        if inputs:
-            body["input_urls"] = inputs
+        urls = _upload_batch_optional(kwargs.get("input_images"))
+        if len(urls) > 2:
+            raise ValueError(f"Seedance 1.5 Pro: max 2 input images, got {len(urls)}.")
+        if urls:
+            body["input_urls"] = urls
         return body
-
-    @staticmethod
-    def _csv(value: str) -> list[str]:
-        if not value:
-            return []
-        return [s.strip() for s in value.split(",") if s.strip()]
 
 
 # ============================================================ Bytedance V1 Pro
 
 class BytedanceV1ProT2V(BaseKieMarketVideoNode):
-    """ByteDance V1 Pro text-to-video. Up to 21:9 aspect ratio."""
-
     MODEL = "bytedance/v1-pro-text-to-video"
     POLL_INTERVAL_SECONDS = 5.0
     TIMEOUT_SECONDS = 900.0
@@ -228,16 +193,11 @@ class BytedanceV1ProT2V(BaseKieMarketVideoNode):
             "nsfw_checker": bool(kwargs.get("nsfw_checker", False)),
         }
         seed = int(kwargs.get("seed") or 0)
-        if seed > 0:
-            body["seed"] = seed
-        else:
-            body["seed"] = -1  # API default for "random"
+        body["seed"] = seed if seed > 0 else -1
         return body
 
 
 class BytedanceV1ProI2V(BaseKieMarketVideoNode):
-    """ByteDance V1 Pro image-to-video. Uses ``image_url`` (single, not array)."""
-
     MODEL = "bytedance/v1-pro-image-to-video"
     POLL_INTERVAL_SECONDS = 5.0
     TIMEOUT_SECONDS = 900.0
@@ -246,7 +206,7 @@ class BytedanceV1ProI2V(BaseKieMarketVideoNode):
     def INPUT_TYPES(cls) -> dict[str, Any]:
         return {
             "required": {
-                "image_url": ("STRING", {"default": "", "tooltip": "Input image URL (required)."}),
+                "image": ("IMAGE", {"tooltip": "Input image."}),
                 "prompt": ("STRING", {"multiline": True, "default": "Cinematic animation."}),
                 "resolution": (["480p", "720p", "1080p"], {"default": "720p"}),
                 "duration": (["5", "10"], {"default": "5"}),
@@ -260,12 +220,9 @@ class BytedanceV1ProI2V(BaseKieMarketVideoNode):
         }
 
     def build_input(self, **kwargs: Any) -> dict[str, Any]:
-        img = (kwargs.get("image_url") or "").strip()
-        if not img:
-            raise ValueError("Bytedance V1 Pro I2V requires image_url.")
         body: dict[str, Any] = {
             "prompt": kwargs["prompt"],
-            "image_url": img,
+            "image_url": _upload_first(kwargs.get("image")),
             "resolution": kwargs["resolution"],
             "duration": str(kwargs["duration"]),
             "camera_fixed": bool(kwargs.get("camera_fixed", False)),
@@ -273,19 +230,11 @@ class BytedanceV1ProI2V(BaseKieMarketVideoNode):
             "nsfw_checker": bool(kwargs.get("nsfw_checker", False)),
         }
         seed = int(kwargs.get("seed") or 0)
-        if seed > 0:
-            body["seed"] = seed
-        else:
-            body["seed"] = -1
+        body["seed"] = seed if seed > 0 else -1
         return body
 
 
 class BytedanceV1ProFastI2V(BaseKieMarketVideoNode):
-    """ByteDance V1 Pro Fast image-to-video.
-
-    Cheaper than V1 Pro I2V. Note: 720p/1080p only (no 480p per docs).
-    """
-
     MODEL = "bytedance/v1-pro-fast-image-to-video"
     POLL_INTERVAL_SECONDS = 4.0
     TIMEOUT_SECONDS = 900.0
@@ -294,7 +243,7 @@ class BytedanceV1ProFastI2V(BaseKieMarketVideoNode):
     def INPUT_TYPES(cls) -> dict[str, Any]:
         return {
             "required": {
-                "image_url": ("STRING", {"default": "", "tooltip": "Input image URL (required)."}),
+                "image": ("IMAGE", {"tooltip": "Input image."}),
                 "prompt": ("STRING", {"multiline": True, "default": "Animated motion."}),
                 "resolution": (["720p", "1080p"], {"default": "720p"}),
                 "duration": (["5", "10"], {"default": "5"}),
@@ -305,12 +254,9 @@ class BytedanceV1ProFastI2V(BaseKieMarketVideoNode):
         }
 
     def build_input(self, **kwargs: Any) -> dict[str, Any]:
-        img = (kwargs.get("image_url") or "").strip()
-        if not img:
-            raise ValueError("Bytedance V1 Pro Fast I2V requires image_url.")
         return {
             "prompt": kwargs["prompt"],
-            "image_url": img,
+            "image_url": _upload_first(kwargs.get("image")),
             "resolution": kwargs["resolution"],
             "duration": str(kwargs["duration"]),
             "nsfw_checker": bool(kwargs.get("nsfw_checker", False)),
@@ -320,8 +266,6 @@ class BytedanceV1ProFastI2V(BaseKieMarketVideoNode):
 # ============================================================ Bytedance V1 Lite
 
 class BytedanceV1LiteT2V(BaseKieMarketVideoNode):
-    """ByteDance V1 Lite text-to-video. Includes 9:21 portrait ratio."""
-
     MODEL = "bytedance/v1-lite-text-to-video"
     POLL_INTERVAL_SECONDS = 5.0
     TIMEOUT_SECONDS = 900.0
@@ -360,8 +304,6 @@ class BytedanceV1LiteT2V(BaseKieMarketVideoNode):
 
 
 class BytedanceV1LiteI2V(BaseKieMarketVideoNode):
-    """ByteDance V1 Lite image-to-video."""
-
     MODEL = "bytedance/v1-lite-image-to-video"
     POLL_INTERVAL_SECONDS = 5.0
     TIMEOUT_SECONDS = 900.0
@@ -370,7 +312,7 @@ class BytedanceV1LiteI2V(BaseKieMarketVideoNode):
     def INPUT_TYPES(cls) -> dict[str, Any]:
         return {
             "required": {
-                "image_url": ("STRING", {"default": "", "tooltip": "Input image URL (required)."}),
+                "image": ("IMAGE", {"tooltip": "Input image."}),
                 "prompt": ("STRING", {"multiline": True, "default": "Subtle animation."}),
                 "resolution": (["480p", "720p", "1080p"], {"default": "720p"}),
                 "duration": (["5", "10"], {"default": "5"}),
@@ -384,12 +326,9 @@ class BytedanceV1LiteI2V(BaseKieMarketVideoNode):
         }
 
     def build_input(self, **kwargs: Any) -> dict[str, Any]:
-        img = (kwargs.get("image_url") or "").strip()
-        if not img:
-            raise ValueError("Bytedance V1 Lite I2V requires image_url.")
         body: dict[str, Any] = {
             "prompt": kwargs["prompt"],
-            "image_url": img,
+            "image_url": _upload_first(kwargs.get("image")),
             "resolution": kwargs["resolution"],
             "duration": str(kwargs["duration"]),
             "camera_fixed": bool(kwargs.get("camera_fixed", False)),
@@ -401,8 +340,6 @@ class BytedanceV1LiteI2V(BaseKieMarketVideoNode):
             body["seed"] = seed
         return body
 
-
-# ----------------------------------------------------------------- Registration
 
 NODE_CLASS_MAPPINGS: dict[str, type] = {
     "GenesisKieSeedance20": Seedance20,
@@ -416,12 +353,12 @@ NODE_CLASS_MAPPINGS: dict[str, type] = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS: dict[str, str] = {
-    "GenesisKieSeedance20": "Kie — Seedance 2.0",
-    "GenesisKieSeedance20Fast": "Kie — Seedance 2.0 Fast",
-    "GenesisKieSeedance15Pro": "Kie — Seedance 1.5 Pro",
-    "GenesisKieBytedanceV1ProT2V": "Kie — Bytedance V1 Pro (T2V)",
-    "GenesisKieBytedanceV1ProI2V": "Kie — Bytedance V1 Pro (I2V)",
-    "GenesisKieBytedanceV1ProFastI2V": "Kie — Bytedance V1 Pro Fast (I2V)",
-    "GenesisKieBytedanceV1LiteT2V": "Kie — Bytedance V1 Lite (T2V)",
-    "GenesisKieBytedanceV1LiteI2V": "Kie — Bytedance V1 Lite (I2V)",
+    "GenesisKieSeedance20": "Seedance 2.0",
+    "GenesisKieSeedance20Fast": "Seedance 2.0 Fast",
+    "GenesisKieSeedance15Pro": "Seedance 1.5 Pro",
+    "GenesisKieBytedanceV1ProT2V": "Bytedance V1 Pro (T2V)",
+    "GenesisKieBytedanceV1ProI2V": "Bytedance V1 Pro (I2V)",
+    "GenesisKieBytedanceV1ProFastI2V": "Bytedance V1 Pro Fast (I2V)",
+    "GenesisKieBytedanceV1LiteT2V": "Bytedance V1 Lite (T2V)",
+    "GenesisKieBytedanceV1LiteI2V": "Bytedance V1 Lite (I2V)",
 }

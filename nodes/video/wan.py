@@ -1,17 +1,10 @@
 """Alibaba Wan video generation nodes (complete family).
 
-Covers all 16 Wan endpoints in Kie.ai:
+16 nodes across Wan 2.7, 2.6, 2.6 Flash, 2.5, 2.2 A14B Turbo, and Wan Animate.
 
-Wan 2.7 (4): T2V, I2V, Video Edit, Reference-to-Video
-Wan 2.6 (3): T2V, I2V, V2V
-Wan 2.6 Flash (2): I2V, V2V
-Wan 2.5 (2): T2V, I2V
-Wan 2.2 A14B Turbo (3): T2V, I2V, Speech-to-Video
-Wan Animate (2): Move, Replace
-
-All use the Market endpoint /api/v1/jobs/createTask.
-
-Parameter schemas extracted verbatim from docs.kie.ai OpenAPI specs.
+Note: nodes that accept reference_video (multi-video refs) take a single
+video tensor for simplicity. To pass multiple ref videos, run the node
+multiple times. URL strings can also be passed via external means.
 """
 
 from __future__ import annotations
@@ -19,17 +12,35 @@ from __future__ import annotations
 from typing import Any, ClassVar
 
 from ..base import BaseKieMarketVideoNode
+from ...client.upload import upload_image_tensor, upload_video_frames, upload_audio
 
 
 _RATIOS_WAN_3 = ["16:9", "9:16", "1:1"]
 _RATIOS_WAN_2 = ["16:9", "9:16"]
 
 
+def _upload_first(image_tensor: Any) -> str:
+    if image_tensor is None or not hasattr(image_tensor, "shape"):
+        raise ValueError("image tensor required")
+    return upload_image_tensor(image_tensor[0:1])
+
+
+def _upload_first_optional(image_tensor: Any) -> str | None:
+    if image_tensor is None:
+        return None
+    return upload_image_tensor(image_tensor[0:1])
+
+
+def _upload_batch_optional(image_tensor: Any) -> list[str]:
+    if image_tensor is None:
+        return []
+    n = image_tensor.shape[0] if len(image_tensor.shape) >= 4 else 1
+    return [upload_image_tensor(image_tensor[i:i + 1]) for i in range(n)]
+
+
 # ============================================================ Wan 2.7
 
 class Wan27T2V(BaseKieMarketVideoNode):
-    """Wan 2.7 text-to-video. Supports optional audio_url to pace generation."""
-
     MODEL = "wan/2-7-text-to-video"
     POLL_INTERVAL_SECONDS = 5.0
     TIMEOUT_SECONDS = 900.0
@@ -38,17 +49,14 @@ class Wan27T2V(BaseKieMarketVideoNode):
     def INPUT_TYPES(cls) -> dict[str, Any]:
         return {
             "required": {
-                "prompt": ("STRING", {
-                    "multiline": True,
-                    "default": "A futuristic city street at night.",
-                }),
+                "prompt": ("STRING", {"multiline": True, "default": "A futuristic city street at night."}),
                 "resolution": (["480p", "720p", "1080p"], {"default": "1080p"}),
                 "ratio": (_RATIOS_WAN_3, {"default": "16:9"}),
                 "duration": ("INT", {"default": 5, "min": 3, "max": 15, "step": 1}),
             },
             "optional": {
                 "negative_prompt": ("STRING", {"multiline": True, "default": "blurry, low quality, flicker"}),
-                "audio_url": ("STRING", {"default": "", "tooltip": "Optional audio track URL."}),
+                "audio": ("AUDIO", {"tooltip": "Optional audio track to pace generation."}),
                 "prompt_extend": ("BOOLEAN", {"default": True}),
                 "watermark": ("BOOLEAN", {"default": False}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 2**31 - 1}),
@@ -67,9 +75,9 @@ class Wan27T2V(BaseKieMarketVideoNode):
         neg = (kwargs.get("negative_prompt") or "").strip()
         if neg:
             body["negative_prompt"] = neg
-        audio = (kwargs.get("audio_url") or "").strip()
-        if audio:
-            body["audio_url"] = audio
+        audio = kwargs.get("audio")
+        if audio is not None:
+            body["audio_url"] = upload_audio(audio)
         seed = int(kwargs.get("seed") or 0)
         if seed > 0:
             body["seed"] = seed
@@ -77,7 +85,7 @@ class Wan27T2V(BaseKieMarketVideoNode):
 
 
 class Wan27I2V(BaseKieMarketVideoNode):
-    """Wan 2.7 image-to-video. 3 sub-modes: first-only, first+last, video-continuation."""
+    """Wan 2.7 I2V — 3 sub-modes: first-only, first+last, video-continuation."""
 
     MODEL = "wan/2-7-image-to-video"
     POLL_INTERVAL_SECONDS = 5.0
@@ -90,11 +98,12 @@ class Wan27I2V(BaseKieMarketVideoNode):
                 "prompt": ("STRING", {"multiline": True, "default": "A white cat on a windowsill in warm light."}),
                 "resolution": (["720p", "1080p"], {"default": "1080p"}),
                 "duration": ("INT", {"default": 5, "min": 3, "max": 15, "step": 1}),
+                "fps": ("INT", {"default": 24, "min": 8, "max": 60, "step": 1}),
             },
             "optional": {
-                "first_frame_url": ("STRING", {"default": "", "tooltip": "First-frame image URL."}),
-                "last_frame_url": ("STRING", {"default": "", "tooltip": "Last-frame URL (transition mode)."}),
-                "first_clip_url": ("STRING", {"default": "", "tooltip": "Video to continue (mutually exclusive with frames)."}),
+                "first_frame": ("IMAGE", {"tooltip": "First-frame image."}),
+                "last_frame": ("IMAGE", {"tooltip": "Last-frame image (transition mode, requires first_frame)."}),
+                "first_clip": ("IMAGE", {"tooltip": "Video to continue (mutually exclusive with frames)."}),
                 "negative_prompt": ("STRING", {"multiline": True, "default": "blurry, flicker, low quality"}),
                 "prompt_extend": ("BOOLEAN", {"default": True}),
                 "watermark": ("BOOLEAN", {"default": False}),
@@ -103,16 +112,16 @@ class Wan27I2V(BaseKieMarketVideoNode):
         }
 
     def build_input(self, **kwargs: Any) -> dict[str, Any]:
-        ff = (kwargs.get("first_frame_url") or "").strip()
-        lf = (kwargs.get("last_frame_url") or "").strip()
-        fc = (kwargs.get("first_clip_url") or "").strip()
+        ff = kwargs.get("first_frame")
+        lf = kwargs.get("last_frame")
+        fc = kwargs.get("first_clip")
 
-        if fc and (ff or lf):
+        if fc is not None and (ff is not None or lf is not None):
             raise ValueError("Wan 2.7 I2V: video continuation mutually exclusive with frame mode.")
-        if not (ff or fc):
-            raise ValueError("Wan 2.7 I2V: must provide first_frame_url or first_clip_url.")
-        if lf and not ff:
-            raise ValueError("Wan 2.7 I2V: last_frame_url requires first_frame_url.")
+        if ff is None and fc is None:
+            raise ValueError("Wan 2.7 I2V: must provide first_frame or first_clip.")
+        if lf is not None and ff is None:
+            raise ValueError("Wan 2.7 I2V: last_frame requires first_frame.")
 
         body: dict[str, Any] = {
             "prompt": kwargs["prompt"],
@@ -121,12 +130,13 @@ class Wan27I2V(BaseKieMarketVideoNode):
             "prompt_extend": bool(kwargs.get("prompt_extend", True)),
             "watermark": bool(kwargs.get("watermark", False)),
         }
-        if ff:
-            body["first_frame_url"] = ff
-        if lf:
-            body["last_frame_url"] = lf
-        if fc:
-            body["first_clip_url"] = fc
+        if ff is not None:
+            body["first_frame_url"] = _upload_first(ff)
+        if lf is not None:
+            body["last_frame_url"] = _upload_first(lf)
+        if fc is not None:
+            fps = int(kwargs.get("fps", 24))
+            body["first_clip_url"] = upload_video_frames(fc, fps=fps)
         neg = (kwargs.get("negative_prompt") or "").strip()
         if neg:
             body["negative_prompt"] = neg
@@ -148,13 +158,14 @@ class Wan27VideoEdit(BaseKieMarketVideoNode):
         return {
             "required": {
                 "prompt": ("STRING", {"multiline": True, "default": "Change the outfit."}),
-                "video_url": ("STRING", {"default": "", "tooltip": "Source video URL (required)."}),
+                "video": ("IMAGE", {"tooltip": "Source video as IMAGE batch."}),
+                "fps": ("INT", {"default": 24, "min": 8, "max": 60, "step": 1}),
                 "resolution": (["480p", "720p", "1080p"], {"default": "1080p"}),
                 "aspect_ratio": (_RATIOS_WAN_3, {"default": "16:9"}),
             },
             "optional": {
-                "reference_image": ("STRING", {"default": "", "tooltip": "Optional reference image URL."}),
-                "duration": ("INT", {"default": 0, "min": 0, "max": 15, "step": 1, "tooltip": "0 = match input."}),
+                "reference_image": ("IMAGE", {"tooltip": "Optional reference image."}),
+                "duration": ("INT", {"default": 0, "min": 0, "max": 15, "step": 1}),
                 "audio_setting": (["auto", "keep", "mute", "regenerate"], {"default": "auto"}),
                 "negative_prompt": ("STRING", {"multiline": True, "default": "low resolution, low quality"}),
                 "prompt_extend": ("BOOLEAN", {"default": True}),
@@ -164,12 +175,13 @@ class Wan27VideoEdit(BaseKieMarketVideoNode):
         }
 
     def build_input(self, **kwargs: Any) -> dict[str, Any]:
-        v = (kwargs.get("video_url") or "").strip()
-        if not v:
-            raise ValueError("Wan 2.7 Video Edit requires video_url.")
+        video_tensor = kwargs.get("video")
+        if video_tensor is None:
+            raise ValueError("Wan 2.7 Video Edit requires video.")
+        fps = int(kwargs.get("fps", 24))
         body: dict[str, Any] = {
             "prompt": kwargs["prompt"],
-            "video_url": v,
+            "video_url": upload_video_frames(video_tensor, fps=fps),
             "resolution": kwargs["resolution"],
             "aspect_ratio": kwargs["aspect_ratio"],
             "duration": int(kwargs.get("duration", 0)),
@@ -177,9 +189,9 @@ class Wan27VideoEdit(BaseKieMarketVideoNode):
             "prompt_extend": bool(kwargs.get("prompt_extend", True)),
             "watermark": bool(kwargs.get("watermark", False)),
         }
-        ref = (kwargs.get("reference_image") or "").strip()
-        if ref:
-            body["reference_image"] = ref
+        ref_url = _upload_first_optional(kwargs.get("reference_image"))
+        if ref_url:
+            body["reference_image"] = ref_url
         neg = (kwargs.get("negative_prompt") or "").strip()
         if neg:
             body["negative_prompt"] = neg
@@ -190,7 +202,7 @@ class Wan27VideoEdit(BaseKieMarketVideoNode):
 
 
 class Wan27R2V(BaseKieMarketVideoNode):
-    """Wan 2.7 reference-to-video. Up to 5 refs (images+videos combined)."""
+    """Wan 2.7 reference-to-video. Up to 5 refs total (images + 1 video)."""
 
     MODEL = "wan/2-7-r2v"
     POLL_INTERVAL_SECONDS = 5.0
@@ -206,10 +218,11 @@ class Wan27R2V(BaseKieMarketVideoNode):
                 "duration": ("INT", {"default": 5, "min": 3, "max": 15, "step": 1}),
             },
             "optional": {
-                "reference_image_urls": ("STRING", {"default": "", "tooltip": "Comma-separated image URLs."}),
-                "reference_video_urls": ("STRING", {"default": "", "tooltip": "Comma-separated video URLs."}),
-                "first_frame_url": ("STRING", {"default": "", "tooltip": "Optional first-frame anchor."}),
-                "reference_voice_url": ("STRING", {"default": "", "tooltip": "Optional voice clip URL."}),
+                "reference_images": ("IMAGE", {"tooltip": "Reference image(s). Batch for multi-ref."}),
+                "reference_video": ("IMAGE", {"tooltip": "Optional reference video (single, IMAGE batch)."}),
+                "fps": ("INT", {"default": 24, "min": 8, "max": 60, "step": 1}),
+                "first_frame": ("IMAGE", {"tooltip": "Optional first-frame anchor."}),
+                "reference_voice": ("AUDIO", {"tooltip": "Optional voice clip."}),
                 "negative_prompt": ("STRING", {"multiline": True, "default": "low quality, errors"}),
                 "prompt_extend": ("BOOLEAN", {"default": True}),
                 "watermark": ("BOOLEAN", {"default": False}),
@@ -218,13 +231,13 @@ class Wan27R2V(BaseKieMarketVideoNode):
         }
 
     def build_input(self, **kwargs: Any) -> dict[str, Any]:
-        imgs = self._csv((kwargs.get("reference_image_urls") or "").strip())
-        vids = self._csv((kwargs.get("reference_video_urls") or "").strip())
-
-        if len(imgs) + len(vids) > 5:
-            raise ValueError(f"Wan 2.7 R2V: combined refs > 5: {len(imgs) + len(vids)}.")
-        if not (imgs or vids):
+        img_urls = _upload_batch_optional(kwargs.get("reference_images"))
+        ref_video = kwargs.get("reference_video")
+        n_refs = len(img_urls) + (1 if ref_video is not None else 0)
+        if n_refs == 0:
             raise ValueError("Wan 2.7 R2V: at least one reference required.")
+        if n_refs > 5:
+            raise ValueError(f"Wan 2.7 R2V: combined refs > 5: {n_refs}.")
 
         body: dict[str, Any] = {
             "prompt": kwargs["prompt"],
@@ -234,16 +247,17 @@ class Wan27R2V(BaseKieMarketVideoNode):
             "prompt_extend": bool(kwargs.get("prompt_extend", True)),
             "watermark": bool(kwargs.get("watermark", False)),
         }
-        if imgs:
-            body["reference_image"] = imgs
-        if vids:
-            body["reference_video"] = vids
-        first = (kwargs.get("first_frame_url") or "").strip()
-        if first:
-            body["first_frame"] = first
-        voice = (kwargs.get("reference_voice_url") or "").strip()
-        if voice:
-            body["reference_voice"] = voice
+        if img_urls:
+            body["reference_image"] = img_urls
+        if ref_video is not None:
+            fps = int(kwargs.get("fps", 24))
+            body["reference_video"] = [upload_video_frames(ref_video, fps=fps)]
+        first_url = _upload_first_optional(kwargs.get("first_frame"))
+        if first_url:
+            body["first_frame"] = first_url
+        voice = kwargs.get("reference_voice")
+        if voice is not None:
+            body["reference_voice"] = upload_audio(voice)
         neg = (kwargs.get("negative_prompt") or "").strip()
         if neg:
             body["negative_prompt"] = neg
@@ -252,18 +266,10 @@ class Wan27R2V(BaseKieMarketVideoNode):
             body["seed"] = seed
         return body
 
-    @staticmethod
-    def _csv(value: str) -> list[str]:
-        if not value:
-            return []
-        return [s.strip() for s in value.split(",") if s.strip()]
-
 
 # ============================================================ Wan 2.6
 
 class Wan26T2V(BaseKieMarketVideoNode):
-    """Wan 2.6 text-to-video (720p/1080p; 5/10/15s)."""
-
     MODEL = "wan/2-6-text-to-video"
     POLL_INTERVAL_SECONDS = 5.0
     TIMEOUT_SECONDS = 900.0
@@ -287,8 +293,6 @@ class Wan26T2V(BaseKieMarketVideoNode):
 
 
 class Wan26I2V(BaseKieMarketVideoNode):
-    """Wan 2.6 image-to-video. Min image 256x256."""
-
     MODEL = "wan/2-6-image-to-video"
     POLL_INTERVAL_SECONDS = 5.0
     TIMEOUT_SECONDS = 900.0
@@ -297,7 +301,7 @@ class Wan26I2V(BaseKieMarketVideoNode):
     def INPUT_TYPES(cls) -> dict[str, Any]:
         return {
             "required": {
-                "image_url": ("STRING", {"default": "", "tooltip": "Input image URL (min 256x256)."}),
+                "image": ("IMAGE", {"tooltip": "Input image (min 256x256)."}),
                 "prompt": ("STRING", {"multiline": True, "default": "Subtle animation."}),
                 "duration": (["5", "10", "15"], {"default": "5"}),
                 "resolution": (["720p", "1080p"], {"default": "1080p"}),
@@ -308,12 +312,9 @@ class Wan26I2V(BaseKieMarketVideoNode):
         }
 
     def build_input(self, **kwargs: Any) -> dict[str, Any]:
-        img = (kwargs.get("image_url") or "").strip()
-        if not img:
-            raise ValueError("Wan 2.6 I2V requires image_url.")
         return {
             "prompt": kwargs["prompt"],
-            "image_urls": [img],
+            "image_urls": [_upload_first(kwargs.get("image"))],
             "duration": str(kwargs["duration"]),
             "resolution": kwargs["resolution"],
             "nsfw_checker": bool(kwargs.get("nsfw_checker", False)),
@@ -321,8 +322,6 @@ class Wan26I2V(BaseKieMarketVideoNode):
 
 
 class Wan26V2V(BaseKieMarketVideoNode):
-    """Wan 2.6 video-to-video. Transform an existing video with a new prompt."""
-
     MODEL = "wan/2-6-video-to-video"
     POLL_INTERVAL_SECONDS = 5.0
     TIMEOUT_SECONDS = 1200.0
@@ -331,20 +330,22 @@ class Wan26V2V(BaseKieMarketVideoNode):
     def INPUT_TYPES(cls) -> dict[str, Any]:
         return {
             "required": {
-                "video_url": ("STRING", {"default": "", "tooltip": "Input video URL (MP4/MOV/MKV, max 10MB)."}),
+                "video": ("IMAGE", {"tooltip": "Source video as IMAGE batch."}),
                 "prompt": ("STRING", {"multiline": True, "default": "Apply cinematic grading."}),
+                "fps": ("INT", {"default": 24, "min": 8, "max": 60, "step": 1}),
                 "duration": (["5", "10"], {"default": "5"}),
                 "resolution": (["720p", "1080p"], {"default": "1080p"}),
             },
         }
 
     def build_input(self, **kwargs: Any) -> dict[str, Any]:
-        v = (kwargs.get("video_url") or "").strip()
-        if not v:
-            raise ValueError("Wan 2.6 V2V requires video_url.")
+        v = kwargs.get("video")
+        if v is None:
+            raise ValueError("Wan 2.6 V2V requires video.")
+        fps = int(kwargs.get("fps", 24))
         return {
             "prompt": kwargs["prompt"],
-            "video_urls": [v],
+            "video_urls": [upload_video_frames(v, fps=fps)],
             "duration": str(kwargs["duration"]),
             "resolution": kwargs["resolution"],
         }
@@ -353,8 +354,6 @@ class Wan26V2V(BaseKieMarketVideoNode):
 # ============================================================ Wan 2.6 Flash
 
 class Wan26FlashI2V(BaseKieMarketVideoNode):
-    """Wan 2.6 Flash image-to-video — cheaper/faster than 2.6."""
-
     MODEL = "wan/2-6-flash-image-to-video"
     POLL_INTERVAL_SECONDS = 4.0
     TIMEOUT_SECONDS = 900.0
@@ -363,11 +362,11 @@ class Wan26FlashI2V(BaseKieMarketVideoNode):
     def INPUT_TYPES(cls) -> dict[str, Any]:
         return {
             "required": {
-                "image_url": ("STRING", {"default": "", "tooltip": "Input image URL (min 256x256)."}),
+                "image": ("IMAGE", {"tooltip": "Input image (min 256x256)."}),
                 "prompt": ("STRING", {"multiline": True, "default": "Subtle animation."}),
                 "duration": (["5", "10", "15"], {"default": "5"}),
                 "resolution": (["720p", "1080p"], {"default": "1080p"}),
-                "audio": ("BOOLEAN", {"default": False, "tooltip": "With audio (affects cost)."}),
+                "audio": ("BOOLEAN", {"default": False}),
             },
             "optional": {
                 "multi_shots": ("BOOLEAN", {"default": False}),
@@ -375,12 +374,9 @@ class Wan26FlashI2V(BaseKieMarketVideoNode):
         }
 
     def build_input(self, **kwargs: Any) -> dict[str, Any]:
-        img = (kwargs.get("image_url") or "").strip()
-        if not img:
-            raise ValueError("Wan 2.6 Flash I2V requires image_url.")
         return {
             "prompt": kwargs["prompt"],
-            "image_urls": [img],
+            "image_urls": [_upload_first(kwargs.get("image"))],
             "duration": str(kwargs["duration"]),
             "resolution": kwargs["resolution"],
             "audio": bool(kwargs.get("audio", False)),
@@ -389,8 +385,6 @@ class Wan26FlashI2V(BaseKieMarketVideoNode):
 
 
 class Wan26FlashV2V(BaseKieMarketVideoNode):
-    """Wan 2.6 Flash video-to-video — cheaper/faster than 2.6 V2V."""
-
     MODEL = "wan/2-6-flash-video-to-video"
     POLL_INTERVAL_SECONDS = 4.0
     TIMEOUT_SECONDS = 1200.0
@@ -399,8 +393,9 @@ class Wan26FlashV2V(BaseKieMarketVideoNode):
     def INPUT_TYPES(cls) -> dict[str, Any]:
         return {
             "required": {
-                "video_url": ("STRING", {"default": "", "tooltip": "Input video URL."}),
+                "video": ("IMAGE", {"tooltip": "Source video as IMAGE batch."}),
                 "prompt": ("STRING", {"multiline": True, "default": "Apply different style."}),
+                "fps": ("INT", {"default": 24, "min": 8, "max": 60, "step": 1}),
                 "duration": (["5", "10"], {"default": "5"}),
                 "resolution": (["720p", "1080p"], {"default": "1080p"}),
             },
@@ -411,12 +406,13 @@ class Wan26FlashV2V(BaseKieMarketVideoNode):
         }
 
     def build_input(self, **kwargs: Any) -> dict[str, Any]:
-        v = (kwargs.get("video_url") or "").strip()
-        if not v:
-            raise ValueError("Wan 2.6 Flash V2V requires video_url.")
+        v = kwargs.get("video")
+        if v is None:
+            raise ValueError("Wan 2.6 Flash V2V requires video.")
+        fps = int(kwargs.get("fps", 24))
         body: dict[str, Any] = {
             "prompt": kwargs["prompt"],
-            "video_urls": [v],
+            "video_urls": [upload_video_frames(v, fps=fps)],
             "duration": str(kwargs["duration"]),
             "resolution": kwargs["resolution"],
             "multi_shots": bool(kwargs.get("multi_shots", False)),
@@ -429,8 +425,6 @@ class Wan26FlashV2V(BaseKieMarketVideoNode):
 # ============================================================ Wan 2.5
 
 class Wan25T2V(BaseKieMarketVideoNode):
-    """Wan 2.5 text-to-video. Max prompt 800 chars."""
-
     MODEL = "wan/2-5-text-to-video"
     POLL_INTERVAL_SECONDS = 5.0
     TIMEOUT_SECONDS = 900.0
@@ -471,8 +465,6 @@ class Wan25T2V(BaseKieMarketVideoNode):
 
 
 class Wan25I2V(BaseKieMarketVideoNode):
-    """Wan 2.5 image-to-video (uses image_url field, not array)."""
-
     MODEL = "wan/2-5-image-to-video"
     POLL_INTERVAL_SECONDS = 5.0
     TIMEOUT_SECONDS = 900.0
@@ -481,7 +473,7 @@ class Wan25I2V(BaseKieMarketVideoNode):
     def INPUT_TYPES(cls) -> dict[str, Any]:
         return {
             "required": {
-                "image_url": ("STRING", {"default": "", "tooltip": "First-frame image URL (required)."}),
+                "image": ("IMAGE", {"tooltip": "First-frame image."}),
                 "prompt": ("STRING", {"multiline": True, "default": "Character speaks and smiles."}),
                 "duration": (["5", "10"], {"default": "5"}),
                 "resolution": (["720p", "1080p"], {"default": "1080p"}),
@@ -495,12 +487,9 @@ class Wan25I2V(BaseKieMarketVideoNode):
         }
 
     def build_input(self, **kwargs: Any) -> dict[str, Any]:
-        img = (kwargs.get("image_url") or "").strip()
-        if not img:
-            raise ValueError("Wan 2.5 I2V requires image_url.")
         body: dict[str, Any] = {
             "prompt": kwargs["prompt"],
-            "image_url": img,
+            "image_url": _upload_first(kwargs.get("image")),
             "duration": str(kwargs["duration"]),
             "resolution": kwargs["resolution"],
             "enable_prompt_expansion": bool(kwargs.get("enable_prompt_expansion", True)),
@@ -518,8 +507,6 @@ class Wan25I2V(BaseKieMarketVideoNode):
 # ============================================================ Wan 2.2 A14B Turbo
 
 class Wan22A14BT2V(BaseKieMarketVideoNode):
-    """Wan 2.2 A14B Turbo text-to-video (open-source 14B params)."""
-
     MODEL = "wan/2-2-a14b-text-to-video-turbo"
     POLL_INTERVAL_SECONDS = 5.0
     TIMEOUT_SECONDS = 900.0
@@ -534,7 +521,7 @@ class Wan22A14BT2V(BaseKieMarketVideoNode):
             },
             "optional": {
                 "enable_prompt_expansion": ("BOOLEAN", {"default": False}),
-                "acceleration": (["none", "regular"], {"default": "none", "tooltip": "Higher = faster, lower quality."}),
+                "acceleration": (["none", "regular"], {"default": "none"}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 2**31 - 1}),
                 "nsfw_checker": ("BOOLEAN", {"default": False}),
             },
@@ -556,8 +543,6 @@ class Wan22A14BT2V(BaseKieMarketVideoNode):
 
 
 class Wan22A14BI2V(BaseKieMarketVideoNode):
-    """Wan 2.2 A14B Turbo image-to-video."""
-
     MODEL = "wan/2-2-a14b-image-to-video-turbo"
     POLL_INTERVAL_SECONDS = 5.0
     TIMEOUT_SECONDS = 900.0
@@ -566,7 +551,7 @@ class Wan22A14BI2V(BaseKieMarketVideoNode):
     def INPUT_TYPES(cls) -> dict[str, Any]:
         return {
             "required": {
-                "image_url": ("STRING", {"default": "", "tooltip": "Input image URL (required)."}),
+                "image": ("IMAGE", {"tooltip": "Input image."}),
                 "prompt": ("STRING", {"multiline": True, "default": "Cinematic low-angle push-in."}),
                 "resolution": (["480p", "720p"], {"default": "720p"}),
             },
@@ -579,11 +564,8 @@ class Wan22A14BI2V(BaseKieMarketVideoNode):
         }
 
     def build_input(self, **kwargs: Any) -> dict[str, Any]:
-        img = (kwargs.get("image_url") or "").strip()
-        if not img:
-            raise ValueError("Wan 2.2 A14B I2V requires image_url.")
         body: dict[str, Any] = {
-            "image_url": img,
+            "image_url": _upload_first(kwargs.get("image")),
             "prompt": kwargs["prompt"],
             "resolution": kwargs["resolution"],
             "enable_prompt_expansion": bool(kwargs.get("enable_prompt_expansion", False)),
@@ -597,11 +579,7 @@ class Wan22A14BI2V(BaseKieMarketVideoNode):
 
 
 class Wan22A14BS2V(BaseKieMarketVideoNode):
-    """Wan 2.2 A14B Turbo speech-to-video (lip-synced from audio).
-
-    Exposes fine-grained controls: num_frames (40-120 step 4), fps (4-60),
-    inference_steps (2-40), guidance_scale, shift.
-    """
+    """Wan 2.2 A14B Turbo speech-to-video: portrait + audio → lip-synced video."""
 
     MODEL = "wan/2-2-a14b-speech-to-video-turbo"
     POLL_INTERVAL_SECONDS = 5.0
@@ -611,8 +589,8 @@ class Wan22A14BS2V(BaseKieMarketVideoNode):
     def INPUT_TYPES(cls) -> dict[str, Any]:
         return {
             "required": {
-                "image_url": ("STRING", {"default": "", "tooltip": "Portrait image URL (required)."}),
-                "audio_url": ("STRING", {"default": "", "tooltip": "Audio file URL (max 10MB)."}),
+                "image": ("IMAGE", {"tooltip": "Portrait image."}),
+                "audio": ("AUDIO", {"tooltip": "Audio file (will sync mouth)."}),
                 "prompt": ("STRING", {"multiline": True, "default": "The person is talking"}),
                 "resolution": (["480p", "580p", "720p"], {"default": "480p"}),
             },
@@ -629,16 +607,16 @@ class Wan22A14BS2V(BaseKieMarketVideoNode):
         }
 
     def build_input(self, **kwargs: Any) -> dict[str, Any]:
-        img = (kwargs.get("image_url") or "").strip()
-        aud = (kwargs.get("audio_url") or "").strip()
-        if not img:
-            raise ValueError("Wan 2.2 Speech-to-Video requires image_url.")
-        if not aud:
-            raise ValueError("Wan 2.2 Speech-to-Video requires audio_url.")
+        img = kwargs.get("image")
+        aud = kwargs.get("audio")
+        if img is None:
+            raise ValueError("Wan 2.2 S2V requires image.")
+        if aud is None:
+            raise ValueError("Wan 2.2 S2V requires audio.")
         body: dict[str, Any] = {
             "prompt": kwargs["prompt"],
-            "image_url": img,
-            "audio_url": aud,
+            "image_url": _upload_first(img),
+            "audio_url": upload_audio(aud),
             "num_frames": int(kwargs.get("num_frames", 80)),
             "frames_per_second": int(kwargs.get("frames_per_second", 16)),
             "resolution": kwargs["resolution"],
@@ -659,10 +637,7 @@ class Wan22A14BS2V(BaseKieMarketVideoNode):
 # ============================================================ Wan Animate
 
 class _WanAnimateBase(BaseKieMarketVideoNode):
-    """Shared scaffolding for Wan Animate Move/Replace.
-
-    Both take motion video + character image and apply motion to character.
-    """
+    """Wan Animate: motion video + character image → animated character."""
 
     POLL_INTERVAL_SECONDS = 5.0
     TIMEOUT_SECONDS = 1200.0
@@ -671,8 +646,9 @@ class _WanAnimateBase(BaseKieMarketVideoNode):
     def INPUT_TYPES(cls) -> dict[str, Any]:
         return {
             "required": {
-                "video_url": ("STRING", {"default": "", "tooltip": "Motion reference video (MP4/MOV/MKV)."}),
-                "image_url": ("STRING", {"default": "", "tooltip": "Character reference image."}),
+                "motion_video": ("IMAGE", {"tooltip": "Motion reference video (IMAGE batch)."}),
+                "character_image": ("IMAGE", {"tooltip": "Character reference image."}),
+                "fps": ("INT", {"default": 24, "min": 8, "max": 60, "step": 1}),
                 "resolution": (["480p", "580p", "720p"], {"default": "480p"}),
             },
             "optional": {
@@ -681,31 +657,28 @@ class _WanAnimateBase(BaseKieMarketVideoNode):
         }
 
     def build_input(self, **kwargs: Any) -> dict[str, Any]:
-        v = (kwargs.get("video_url") or "").strip()
-        i = (kwargs.get("image_url") or "").strip()
-        if not v:
-            raise ValueError(f"{type(self).__name__} requires video_url.")
-        if not i:
-            raise ValueError(f"{type(self).__name__} requires image_url.")
+        v = kwargs.get("motion_video")
+        i = kwargs.get("character_image")
+        if v is None:
+            raise ValueError(f"{type(self).__name__} requires motion_video.")
+        if i is None:
+            raise ValueError(f"{type(self).__name__} requires character_image.")
+        fps = int(kwargs.get("fps", 24))
         return {
-            "video_url": v,
-            "image_url": i,
+            "video_url": upload_video_frames(v, fps=fps),
+            "image_url": _upload_first(i),
             "resolution": kwargs["resolution"],
             "nsfw_checker": bool(kwargs.get("nsfw_checker", False)),
         }
 
 
 class WanAnimateMove(_WanAnimateBase):
-    """Wan Animate Move — make character in image perform motion from video."""
     MODEL = "wan/2-2-animate-move"
 
 
 class WanAnimateReplace(_WanAnimateBase):
-    """Wan Animate Replace — swap the character in a video with the image."""
     MODEL = "wan/2-2-animate-replace"
 
-
-# ----------------------------------------------------------------- Registration
 
 NODE_CLASS_MAPPINGS: dict[str, type] = {
     "GenesisKieWan27T2V": Wan27T2V,
@@ -727,20 +700,20 @@ NODE_CLASS_MAPPINGS: dict[str, type] = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS: dict[str, str] = {
-    "GenesisKieWan27T2V": "Kie — Wan 2.7 (T2V)",
-    "GenesisKieWan27I2V": "Kie — Wan 2.7 (I2V)",
-    "GenesisKieWan27VideoEdit": "Kie — Wan 2.7 Video Edit",
-    "GenesisKieWan27R2V": "Kie — Wan 2.7 Reference-to-Video",
-    "GenesisKieWan26T2V": "Kie — Wan 2.6 (T2V)",
-    "GenesisKieWan26I2V": "Kie — Wan 2.6 (I2V)",
-    "GenesisKieWan26V2V": "Kie — Wan 2.6 (V2V)",
-    "GenesisKieWan26FlashI2V": "Kie — Wan 2.6 Flash (I2V)",
-    "GenesisKieWan26FlashV2V": "Kie — Wan 2.6 Flash (V2V)",
-    "GenesisKieWan25T2V": "Kie — Wan 2.5 (T2V)",
-    "GenesisKieWan25I2V": "Kie — Wan 2.5 (I2V)",
-    "GenesisKieWan22A14BT2V": "Kie — Wan 2.2 A14B Turbo (T2V)",
-    "GenesisKieWan22A14BI2V": "Kie — Wan 2.2 A14B Turbo (I2V)",
-    "GenesisKieWan22A14BS2V": "Kie — Wan 2.2 A14B Turbo Speech",
-    "GenesisKieWanAnimateMove": "Kie — Wan Animate Move",
-    "GenesisKieWanAnimateReplace": "Kie — Wan Animate Replace",
+    "GenesisKieWan27T2V": "Wan 2.7 (T2V)",
+    "GenesisKieWan27I2V": "Wan 2.7 (I2V)",
+    "GenesisKieWan27VideoEdit": "Wan 2.7 Video Edit",
+    "GenesisKieWan27R2V": "Wan 2.7 Reference-to-Video",
+    "GenesisKieWan26T2V": "Wan 2.6 (T2V)",
+    "GenesisKieWan26I2V": "Wan 2.6 (I2V)",
+    "GenesisKieWan26V2V": "Wan 2.6 (V2V)",
+    "GenesisKieWan26FlashI2V": "Wan 2.6 Flash (I2V)",
+    "GenesisKieWan26FlashV2V": "Wan 2.6 Flash (V2V)",
+    "GenesisKieWan25T2V": "Wan 2.5 (T2V)",
+    "GenesisKieWan25I2V": "Wan 2.5 (I2V)",
+    "GenesisKieWan22A14BT2V": "Wan 2.2 A14B Turbo (T2V)",
+    "GenesisKieWan22A14BI2V": "Wan 2.2 A14B Turbo (I2V)",
+    "GenesisKieWan22A14BS2V": "Wan 2.2 A14B Turbo Speech",
+    "GenesisKieWanAnimateMove": "Wan Animate Move",
+    "GenesisKieWanAnimateReplace": "Wan Animate Replace",
 }

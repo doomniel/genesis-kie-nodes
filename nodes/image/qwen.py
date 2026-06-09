@@ -1,26 +1,7 @@
-"""Alibaba Qwen image nodes (via Kie.ai).
+"""Alibaba Qwen image nodes (via GenesisLab proxy / Kie.ai).
 
-Covers all 5 Qwen image endpoints in Kie.ai's Market:
-
-- qwen/text-to-image
-- qwen/image-to-image
-- qwen/image-edit
-- qwen2/text-to-image
-- qwen2/image-edit
-
-Per docs.kie.ai cURL examples:
-
-Qwen v1:
-- T2I: prompt, image_size ("16:9"), seed, num_inference_steps, guidance_scale,
-       negative_prompt, acceleration, output_format, enable_safety_checker
-- I2I: prompt, image_url (singular), strength, +above
-- Edit: prompt, image_url, +above
-
-Qwen v2 (newer):
-- T2I: prompt, image_size ("16:9"), seed, output_format
-- Edit: prompt, image_url, seed, output_format
-
-Qwen2 has a simpler API surface than Qwen v1.
+Qwen v1 + v2. All I2I/Edit variants accept a single IMAGE input
+(qwen uses singular ``image_url`` body field).
 """
 
 from __future__ import annotations
@@ -28,19 +9,21 @@ from __future__ import annotations
 from typing import Any, ClassVar
 
 from ..base import BaseKieMarketImageNode
+from ...client.upload import upload_image_tensor
 
 
-# Qwen accepts aspect-ratio strings as ``image_size`` (not enum-like for v2).
 _QWEN_RATIOS = ["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3"]
 _QWEN_FORMATS = ["png", "jpeg", "webp"]
 _QWEN_ACCELERATIONS = ["none", "regular", "high"]
 
 
-# ============================================================ Qwen v1
+def _upload_first(image_tensor: Any) -> str:
+    if image_tensor is None or not hasattr(image_tensor, "shape"):
+        raise ValueError("image tensor required")
+    return upload_image_tensor(image_tensor[0:1])
+
 
 class QwenT2I(BaseKieMarketImageNode):
-    """Qwen v1 text-to-image (Alibaba multimodal generation)."""
-
     MODEL = "qwen/text-to-image"
     POLL_INTERVAL_SECONDS = 3.0
     TIMEOUT_SECONDS = 300.0
@@ -54,12 +37,8 @@ class QwenT2I(BaseKieMarketImageNode):
                     "default": "A photorealistic portrait of a craftsperson in their workshop.",
                 }),
                 "image_size": (_QWEN_RATIOS, {"default": "1:1"}),
-                "num_inference_steps": ("INT", {
-                    "default": 30, "min": 10, "max": 50, "step": 1,
-                }),
-                "guidance_scale": ("FLOAT", {
-                    "default": 2.5, "min": 0.0, "max": 10.0, "step": 0.1,
-                }),
+                "num_inference_steps": ("INT", {"default": 30, "min": 10, "max": 50, "step": 1}),
+                "guidance_scale": ("FLOAT", {"default": 2.5, "min": 0.0, "max": 10.0, "step": 0.1}),
             },
             "optional": {
                 "negative_prompt": ("STRING", {"multiline": True, "default": "blurry, ugly"}),
@@ -85,11 +64,6 @@ class QwenT2I(BaseKieMarketImageNode):
 
 
 class QwenI2I(BaseKieMarketImageNode):
-    """Qwen v1 image-to-image (transform with strength control).
-
-    Per docs cURL: prompt, image_url (SINGULAR), strength.
-    """
-
     MODEL = "qwen/image-to-image"
     POLL_INTERVAL_SECONDS = 3.0
     TIMEOUT_SECONDS = 300.0
@@ -102,13 +76,9 @@ class QwenI2I(BaseKieMarketImageNode):
                     "multiline": True,
                     "default": "Apply impressionist painting style to the subject.",
                 }),
-                "image_url": ("STRING", {
-                    "default": "",
-                    "tooltip": "Single source image URL (Qwen v1 uses singular).",
-                }),
+                "image": ("IMAGE", {"tooltip": "Source image."}),
                 "strength": ("FLOAT", {
                     "default": 0.8, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "0.0 = preserve source / 1.0 = full transformation.",
                 }),
             },
             "optional": {
@@ -123,13 +93,10 @@ class QwenI2I(BaseKieMarketImageNode):
         }
 
     def build_input(self, **kwargs: Any) -> dict[str, Any]:
-        img = (kwargs.get("image_url") or "").strip()
-        if not img:
-            raise ValueError("Qwen I2I requires image_url.")
-
+        url = _upload_first(kwargs.get("image"))
         return {
             "prompt": kwargs["prompt"],
-            "image_url": img,
+            "image_url": url,
             "strength": float(kwargs["strength"]),
             "negative_prompt": kwargs.get("negative_prompt", "") or "",
             "num_inference_steps": int(kwargs.get("num_inference_steps", 30)),
@@ -142,12 +109,6 @@ class QwenI2I(BaseKieMarketImageNode):
 
 
 class QwenImageEdit(BaseKieMarketImageNode):
-    """Qwen v1 image-edit (precise instruction-based editing).
-
-    Distinct from I2I: Edit is for surgical changes (add/remove/swap elements)
-    while I2I is for full style transfers.
-    """
-
     MODEL = "qwen/image-edit"
     POLL_INTERVAL_SECONDS = 3.0
     TIMEOUT_SECONDS = 360.0
@@ -160,7 +121,7 @@ class QwenImageEdit(BaseKieMarketImageNode):
                     "multiline": True,
                     "default": "Change the sky to a sunset with orange and pink clouds.",
                 }),
-                "image_url": ("STRING", {"default": "", "tooltip": "Source image URL."}),
+                "image": ("IMAGE", {"tooltip": "Source image."}),
             },
             "optional": {
                 "negative_prompt": ("STRING", {"multiline": True, "default": ""}),
@@ -172,13 +133,10 @@ class QwenImageEdit(BaseKieMarketImageNode):
         }
 
     def build_input(self, **kwargs: Any) -> dict[str, Any]:
-        img = (kwargs.get("image_url") or "").strip()
-        if not img:
-            raise ValueError("Qwen Image Edit requires image_url.")
-
+        url = _upload_first(kwargs.get("image"))
         return {
             "prompt": kwargs["prompt"],
-            "image_url": img,
+            "image_url": url,
             "negative_prompt": kwargs.get("negative_prompt", "") or "",
             "num_inference_steps": int(kwargs.get("num_inference_steps", 30)),
             "guidance_scale": float(kwargs.get("guidance_scale", 2.5)),
@@ -187,14 +145,7 @@ class QwenImageEdit(BaseKieMarketImageNode):
         }
 
 
-# ============================================================ Qwen v2
-
 class Qwen2T2I(BaseKieMarketImageNode):
-    """Qwen v2 text-to-image (next-gen, simpler API surface).
-
-    Per docs cURL: prompt, image_size, seed, output_format.
-    """
-
     MODEL = "qwen2/text-to-image"
     POLL_INTERVAL_SECONDS = 3.0
     TIMEOUT_SECONDS = 300.0
@@ -225,11 +176,6 @@ class Qwen2T2I(BaseKieMarketImageNode):
 
 
 class Qwen2ImageEdit(BaseKieMarketImageNode):
-    """Qwen v2 image-edit (next-gen editing).
-
-    Note: body schema inferred from Qwen v1 Edit + Qwen v2 T2I patterns.
-    """
-
     MODEL = "qwen2/image-edit"
     POLL_INTERVAL_SECONDS = 3.0
     TIMEOUT_SECONDS = 360.0
@@ -242,7 +188,7 @@ class Qwen2ImageEdit(BaseKieMarketImageNode):
                     "multiline": True,
                     "default": "Add a small dog walking beside the person in the image.",
                 }),
-                "image_url": ("STRING", {"default": "", "tooltip": "Source image URL."}),
+                "image": ("IMAGE", {"tooltip": "Source image."}),
             },
             "optional": {
                 "seed": ("INT", {"default": 0, "min": 0, "max": 2**31 - 1}),
@@ -251,19 +197,14 @@ class Qwen2ImageEdit(BaseKieMarketImageNode):
         }
 
     def build_input(self, **kwargs: Any) -> dict[str, Any]:
-        img = (kwargs.get("image_url") or "").strip()
-        if not img:
-            raise ValueError("Qwen2 Image Edit requires image_url.")
-
+        url = _upload_first(kwargs.get("image"))
         return {
             "prompt": kwargs["prompt"],
-            "image_url": img,
+            "image_url": url,
             "seed": int(kwargs.get("seed") or 0),
             "output_format": kwargs.get("output_format", "png"),
         }
 
-
-# ----------------------------------------------------------------- Registration
 
 NODE_CLASS_MAPPINGS: dict[str, type] = {
     "GenesisKieQwenT2I": QwenT2I,
@@ -274,9 +215,9 @@ NODE_CLASS_MAPPINGS: dict[str, type] = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS: dict[str, str] = {
-    "GenesisKieQwenT2I": "Kie — Qwen (T2I)",
-    "GenesisKieQwenI2I": "Kie — Qwen (I2I)",
-    "GenesisKieQwenImageEdit": "Kie — Qwen Image Edit",
-    "GenesisKieQwen2T2I": "Kie — Qwen2 (T2I)",
-    "GenesisKieQwen2ImageEdit": "Kie — Qwen2 Image Edit",
+    "GenesisKieQwenT2I": "Qwen (T2I)",
+    "GenesisKieQwenI2I": "Qwen (I2I)",
+    "GenesisKieQwenImageEdit": "Qwen Image Edit",
+    "GenesisKieQwen2T2I": "Qwen2 (T2I)",
+    "GenesisKieQwen2ImageEdit": "Qwen2 Image Edit",
 }

@@ -1,66 +1,49 @@
-"""Video utility nodes: Topaz upscale, Infinitalk lip-sync, Grok upscale/extend.
-
-These don't fit cleanly under a single brand family.
-
-- Topaz Video Upscale     (topaz/video-upscale)
-- Infinitalk From Audio   (infinitalk/from-audio)
-- Grok Imagine Upscale    (grok-imagine/upscale)
-- Grok Imagine Extend     (grok-imagine/extend)
-
-The Grok upscale/extend take a ``task_id`` from a previous Kie generation
-(not an external video URL) — only Kie-generated videos can be processed.
-"""
+"""Video utility nodes: Topaz upscale, Infinitalk lip-sync, Grok upscale/extend."""
 
 from __future__ import annotations
 
 from typing import Any
 
 from ..base import BaseKieMarketVideoNode
+from ...client.upload import upload_image_tensor, upload_video_frames, upload_audio
 
 
-# ============================================================ Topaz
+def _upload_first(image_tensor: Any) -> str:
+    if image_tensor is None or not hasattr(image_tensor, "shape"):
+        raise ValueError("image tensor required")
+    return upload_image_tensor(image_tensor[0:1])
+
 
 class TopazVideoUpscale(BaseKieMarketVideoNode):
-    """Topaz Video Upscale (AI super-resolution).
-
-    Upscale factor: "1" / "2" / "4". Default 2x.
-    Input: MP4/MOV/MKV, max 10MB.
-    """
+    """Topaz Video Upscale. Input as IMAGE batch (frames)."""
 
     MODEL = "topaz/video-upscale"
     POLL_INTERVAL_SECONDS = 6.0
-    TIMEOUT_SECONDS = 1800.0  # Upscaling can be slow.
+    TIMEOUT_SECONDS = 1800.0
 
     @classmethod
     def INPUT_TYPES(cls) -> dict[str, Any]:
         return {
             "required": {
-                "video_url": ("STRING", {
-                    "default": "",
-                    "tooltip": "Source video URL (MP4/MOV/MKV, max 10MB).",
-                }),
+                "video": ("IMAGE", {"tooltip": "Source video as IMAGE batch (N frames)."}),
                 "upscale_factor": (["1", "2", "4"], {"default": "2"}),
+                "fps": ("INT", {"default": 24, "min": 8, "max": 60, "step": 1}),
             },
         }
 
     def build_input(self, **kwargs: Any) -> dict[str, Any]:
-        v = (kwargs.get("video_url") or "").strip()
-        if not v:
-            raise ValueError("Topaz Video Upscale requires video_url.")
+        video_tensor = kwargs.get("video")
+        if video_tensor is None:
+            raise ValueError("Topaz Video Upscale requires video input (IMAGE batch).")
+        fps = int(kwargs.get("fps", 24))
         return {
-            "video_url": v,
+            "video_url": upload_video_frames(video_tensor, fps=fps),
             "upscale_factor": str(kwargs["upscale_factor"]),
         }
 
 
-# ============================================================ Infinitalk
-
 class InfinitalkFromAudio(BaseKieMarketVideoNode):
-    """Infinitalk — lip-sync video from portrait image + audio.
-
-    Required: image_url + audio_url + prompt.
-    Resolution: 480p / 720p. Seed range: 10000-1000000.
-    """
+    """Infinitalk — lip-sync video from portrait IMAGE + AUDIO."""
 
     MODEL = "infinitalk/from-audio"
     POLL_INTERVAL_SECONDS = 5.0
@@ -70,14 +53,8 @@ class InfinitalkFromAudio(BaseKieMarketVideoNode):
     def INPUT_TYPES(cls) -> dict[str, Any]:
         return {
             "required": {
-                "image_url": ("STRING", {
-                    "default": "",
-                    "tooltip": "Portrait image URL (required).",
-                }),
-                "audio_url": ("STRING", {
-                    "default": "",
-                    "tooltip": "Audio file URL (max 10MB).",
-                }),
+                "image": ("IMAGE", {"tooltip": "Portrait image."}),
+                "audio": ("AUDIO", {"tooltip": "Audio (will sync mouth to it)."}),
                 "prompt": ("STRING", {
                     "multiline": True,
                     "default": "A young woman with long dark hair talking on a podcast.",
@@ -85,23 +62,21 @@ class InfinitalkFromAudio(BaseKieMarketVideoNode):
                 "resolution": (["480p", "720p"], {"default": "480p"}),
             },
             "optional": {
-                "seed": ("INT", {
-                    "default": 0, "min": 0, "max": 1_000_000,
-                    "tooltip": "Seed (10000-1000000). 0 = random.",
-                }),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 1_000_000}),
             },
         }
 
     def build_input(self, **kwargs: Any) -> dict[str, Any]:
-        img = (kwargs.get("image_url") or "").strip()
-        aud = (kwargs.get("audio_url") or "").strip()
-        if not img:
-            raise ValueError("Infinitalk requires image_url.")
-        if not aud:
-            raise ValueError("Infinitalk requires audio_url.")
+        img = kwargs.get("image")
+        aud = kwargs.get("audio")
+        if img is None:
+            raise ValueError("Infinitalk requires image input.")
+        if aud is None:
+            raise ValueError("Infinitalk requires audio input.")
+
         body: dict[str, Any] = {
-            "image_url": img,
-            "audio_url": aud,
+            "image_url": _upload_first(img),
+            "audio_url": upload_audio(aud),
             "prompt": kwargs["prompt"],
             "resolution": kwargs["resolution"],
         }
@@ -111,14 +86,8 @@ class InfinitalkFromAudio(BaseKieMarketVideoNode):
         return body
 
 
-# ============================================================ Grok extras
-
 class GrokImagineUpscale(BaseKieMarketVideoNode):
-    """Grok Imagine Video Upscale.
-
-    Takes a ``task_id`` from a previous Kie-generated video task. Only
-    Kie AI–generated videos can be upscaled.
-    """
+    """Grok Imagine Video Upscale (task_id-only)."""
 
     MODEL = "grok-imagine/upscale"
     POLL_INTERVAL_SECONDS = 5.0
@@ -128,10 +97,7 @@ class GrokImagineUpscale(BaseKieMarketVideoNode):
     def INPUT_TYPES(cls) -> dict[str, Any]:
         return {
             "required": {
-                "task_id": ("STRING", {
-                    "default": "",
-                    "tooltip": "Task ID from a previous Kie video task (max 100 chars).",
-                }),
+                "task_id": ("STRING", {"default": "", "tooltip": "Task ID from a prior Kie video task."}),
             },
         }
 
@@ -140,16 +106,12 @@ class GrokImagineUpscale(BaseKieMarketVideoNode):
         if not tid:
             raise ValueError("Grok Imagine Upscale requires task_id.")
         if len(tid) > 100:
-            raise ValueError(f"Grok Imagine Upscale: task_id exceeds 100 chars (got {len(tid)}).")
+            raise ValueError(f"task_id exceeds 100 chars (got {len(tid)}).")
         return {"task_id": tid}
 
 
 class GrokImagineExtend(BaseKieMarketVideoNode):
-    """Grok Imagine Video Extend.
-
-    Extends a previously generated Kie video by N seconds.
-    Required: task_id (from a Kie video task).
-    """
+    """Grok Imagine Video Extend (task_id-only)."""
 
     MODEL = "grok-imagine/extend"
     POLL_INTERVAL_SECONDS = 5.0
@@ -159,25 +121,12 @@ class GrokImagineExtend(BaseKieMarketVideoNode):
     def INPUT_TYPES(cls) -> dict[str, Any]:
         return {
             "required": {
-                "task_id": ("STRING", {
-                    "default": "",
-                    "tooltip": "Task ID from a previous Kie video task.",
-                }),
-                "extend_times": (["6"], {
-                    "default": "6",
-                    "tooltip": "Seconds to extend (per docs example).",
-                }),
+                "task_id": ("STRING", {"default": ""}),
+                "extend_times": (["6"], {"default": "6"}),
             },
             "optional": {
-                "prompt": ("STRING", {
-                    "multiline": True,
-                    "default": "",
-                    "tooltip": "Optional prompt to guide the extension.",
-                }),
-                "extend_at": ("INT", {
-                    "default": 0, "min": 0, "max": 60,
-                    "tooltip": "Timestamp (in seconds) at which to extend.",
-                }),
+                "prompt": ("STRING", {"multiline": True, "default": ""}),
+                "extend_at": ("INT", {"default": 0, "min": 0, "max": 60}),
             },
         }
 
@@ -193,8 +142,6 @@ class GrokImagineExtend(BaseKieMarketVideoNode):
         }
 
 
-# ----------------------------------------------------------------- Registration
-
 NODE_CLASS_MAPPINGS: dict[str, type] = {
     "GenesisKieTopazVideoUpscale": TopazVideoUpscale,
     "GenesisKieInfinitalkFromAudio": InfinitalkFromAudio,
@@ -203,8 +150,8 @@ NODE_CLASS_MAPPINGS: dict[str, type] = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS: dict[str, str] = {
-    "GenesisKieTopazVideoUpscale": "Kie — Topaz Video Upscale",
-    "GenesisKieInfinitalkFromAudio": "Kie — Infinitalk (Audio → Video)",
-    "GenesisKieGrokImagineUpscale": "Kie — Grok Imagine Upscale",
-    "GenesisKieGrokImagineExtend": "Kie — Grok Imagine Extend",
+    "GenesisKieTopazVideoUpscale": "Topaz Video Upscale",
+    "GenesisKieInfinitalkFromAudio": "Infinitalk (Audio → Video)",
+    "GenesisKieGrokImagineUpscale": "Grok Imagine Upscale",
+    "GenesisKieGrokImagineExtend": "Grok Imagine Extend",
 }

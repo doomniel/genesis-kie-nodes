@@ -68,5 +68,5 @@ NODE_CLASS_MAPPINGS: dict[str, type] = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS: dict[str, str] = {
-    "GenesisKieZImage": "Kie — Z-Image (Alibaba)",
+    "GenesisKieZImage": "Z-Image (Alibaba)",
 }

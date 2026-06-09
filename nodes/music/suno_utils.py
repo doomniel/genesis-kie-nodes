@@ -303,9 +303,9 @@ NODE_CLASS_MAPPINGS: dict[str, type] = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS: dict[str, str] = {
-    "GenesisKieSunoGenerateLyrics": "Kie — Suno Generate Lyrics",
-    "GenesisKieSunoGetTimestampedLyrics": "Kie — Suno Timestamped Lyrics",
-    "GenesisKieSunoConvertToWAV": "Kie — Suno Convert to WAV",
-    "GenesisKieSunoVocalRemoval": "Kie — Suno Vocal Removal (Stems)",
-    "GenesisKieSunoGenerateMIDI": "Kie — Suno Generate MIDI",
+    "GenesisKieSunoGenerateLyrics": "Suno Generate Lyrics",
+    "GenesisKieSunoGetTimestampedLyrics": "Suno Timestamped Lyrics",
+    "GenesisKieSunoConvertToWAV": "Suno Convert to WAV",
+    "GenesisKieSunoVocalRemoval": "Suno Vocal Removal (Stems)",
+    "GenesisKieSunoGenerateMIDI": "Suno Generate MIDI",
 }

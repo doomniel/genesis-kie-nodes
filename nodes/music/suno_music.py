@@ -791,15 +791,15 @@ NODE_CLASS_MAPPINGS: dict[str, type] = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS: dict[str, str] = {
-    "GenesisKieSunoGenerateMusic": "Kie — Suno Generate Music",
-    "GenesisKieSunoExtendMusic": "Kie — Suno Extend Music",
-    "GenesisKieSunoUploadAndCover": "Kie — Suno Upload And Cover",
-    "GenesisKieSunoUploadAndExtend": "Kie — Suno Upload And Extend",
-    "GenesisKieSunoMusicCover": "Kie — Suno Music Cover",
-    "GenesisKieSunoAddInstrumental": "Kie — Suno Add Instrumental",
-    "GenesisKieSunoAddVocals": "Kie — Suno Add Vocals",
-    "GenesisKieSunoBoostStyle": "Kie — Suno Boost Style",
-    "GenesisKieSunoReplaceSection": "Kie — Suno Replace Section",
-    "GenesisKieSunoGeneratePersona": "Kie — Suno Generate Persona",
-    "GenesisKieSunoMashup": "Kie — Suno Mashup",
+    "GenesisKieSunoGenerateMusic": "Suno Generate Music",
+    "GenesisKieSunoExtendMusic": "Suno Extend Music",
+    "GenesisKieSunoUploadAndCover": "Suno Upload And Cover",
+    "GenesisKieSunoUploadAndExtend": "Suno Upload And Extend",
+    "GenesisKieSunoMusicCover": "Suno Music Cover",
+    "GenesisKieSunoAddInstrumental": "Suno Add Instrumental",
+    "GenesisKieSunoAddVocals": "Suno Add Vocals",
+    "GenesisKieSunoBoostStyle": "Suno Boost Style",
+    "GenesisKieSunoReplaceSection": "Suno Replace Section",
+    "GenesisKieSunoGeneratePersona": "Suno Generate Persona",
+    "GenesisKieSunoMashup": "Suno Mashup",
 }

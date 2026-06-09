@@ -1,36 +1,25 @@
-"""xAI Grok Imagine image nodes (via Kie.ai).
-
-Grok Imagine is xAI's multimodal image generation model.
-Per docs.kie.ai cURL examples — minimal API: prompt + aspect_ratio for T2I,
-plus image_urls for I2I.
-
-Covers the 2 Grok Imagine image endpoints:
-
-- grok-imagine/text-to-image
-- grok-imagine/image-to-image
-"""
+"""xAI Grok Imagine image nodes (via GenesisLab proxy / Kie.ai)."""
 
 from __future__ import annotations
 
 from typing import Any
 
 from ..base import BaseKieMarketImageNode
+from ...client.upload import upload_image_tensor
 
 
 _GROK_RATIOS = ["1:1", "16:9", "9:16", "3:2", "2:3", "4:3", "3:4"]
 
 
-def _csv(value: str) -> list[str]:
-    if not value:
-        return []
-    return [s.strip() for s in value.split(",") if s.strip()]
+def _upload_batch(image_tensor: Any) -> list[str]:
+    if image_tensor is None or not hasattr(image_tensor, "shape"):
+        raise ValueError("image tensor required")
+    n = image_tensor.shape[0] if len(image_tensor.shape) >= 4 else 1
+    return [upload_image_tensor(image_tensor[i:i + 1]) for i in range(n)]
 
 
 class GrokImagineT2I(BaseKieMarketImageNode):
-    """Grok Imagine Text-to-Image (xAI photorealistic generation).
-
-    Per docs cURL: minimal API — only prompt + aspect_ratio confirmed.
-    """
+    """Grok Imagine Text-to-Image (xAI photorealistic generation)."""
 
     MODEL = "grok-imagine/text-to-image"
     POLL_INTERVAL_SECONDS = 3.0
@@ -44,7 +33,7 @@ class GrokImagineT2I(BaseKieMarketImageNode):
                     "multiline": True,
                     "default": (
                         "Cinematic portrait of a woman by a vinyl record player, "
-                        "retro living room, soft ambient lighting, vintage editorial style."
+                        "retro living room, soft ambient lighting."
                     ),
                 }),
                 "aspect_ratio": (_GROK_RATIOS, {"default": "3:2"}),
@@ -59,13 +48,7 @@ class GrokImagineT2I(BaseKieMarketImageNode):
 
 
 class GrokImagineI2I(BaseKieMarketImageNode):
-    """Grok Imagine Image-to-Image (transform existing images).
-
-    Note: body schema inferred from grok-imagine/text-to-image + general
-    Kie I2I patterns. The exact field name for the reference image may
-    be ``image_url`` (singular) or ``image_urls`` (array); both forms
-    are supported by this node — adjust the array length in CSV input.
-    """
+    """Grok Imagine Image-to-Image (transform existing images)."""
 
     MODEL = "grok-imagine/image-to-image"
     POLL_INTERVAL_SECONDS = 3.0
@@ -79,27 +62,24 @@ class GrokImagineI2I(BaseKieMarketImageNode):
                     "multiline": True,
                     "default": "Transform the photo into a watercolor painting style.",
                 }),
-                "image_urls": ("STRING", {
-                    "default": "",
-                    "tooltip": "Comma-separated reference image URLs.",
+                "images": ("IMAGE", {
+                    "tooltip": "Reference image(s). Batch for multi-ref.",
                 }),
                 "aspect_ratio": (_GROK_RATIOS, {"default": "3:2"}),
             },
         }
 
     def build_input(self, **kwargs: Any) -> dict[str, Any]:
-        imgs = _csv((kwargs.get("image_urls") or "").strip())
-        if not imgs:
-            raise ValueError("Grok Imagine I2I requires at least one image_url.")
+        urls = _upload_batch(kwargs.get("images"))
+        if not urls:
+            raise ValueError("Grok Imagine I2I requires at least one image.")
 
         return {
             "prompt": kwargs["prompt"],
-            "image_urls": imgs,
+            "image_urls": urls,
             "aspect_ratio": kwargs["aspect_ratio"],
         }
 
-
-# ----------------------------------------------------------------- Registration
 
 NODE_CLASS_MAPPINGS: dict[str, type] = {
     "GenesisKieGrokImagineT2I": GrokImagineT2I,
@@ -107,6 +87,6 @@ NODE_CLASS_MAPPINGS: dict[str, type] = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS: dict[str, str] = {
-    "GenesisKieGrokImagineT2I": "Kie — Grok Imagine (T2I)",
-    "GenesisKieGrokImagineI2I": "Kie — Grok Imagine (I2I)",
+    "GenesisKieGrokImagineT2I": "Grok Imagine (T2I)",
+    "GenesisKieGrokImagineI2I": "Grok Imagine (I2I)",
 }

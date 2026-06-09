@@ -1,40 +1,25 @@
-"""Veo 3.1 video generation nodes.
-
-Veo 3.1 in Kie.ai uses a DEDICATED API (not the generic Market endpoint).
-The model identifiers are:
-
-- ``veo3``       → Quality (top tier)
-- ``veo3_fast``  → Fast (balanced)
-- ``veo3_lite``  → Lite (cheapest)
-
-Endpoints used:
-- POST /api/v1/veo/generate
-- GET  /api/v1/veo/record-info?taskId=X
-
-Pricing reference (Kie.ai, 2026):
-    Lite 720p / 8s audio       $0.15  /video
-    Lite 1080p / 8s audio      $0.175 /video
-    Fast 720p / 8s audio       $0.30  /video
-    Fast 4K / 8s audio         $0.90  /video
-    Quality 1080p / 8s audio   $1.275 /video
-    Quality 4K / 8s audio      $1.85  /video
-"""
+"""Veo 3.1 video generation nodes (dedicated API via GenesisLab proxy / Kie.ai)."""
 
 from __future__ import annotations
 
 from typing import Any, ClassVar
 
 from ..base import BaseKieVeoVideoNode
+from ...client.upload import upload_image_tensor
 
 
 _RESOLUTIONS = ["720p", "1080p", "4k"]
 _ASPECT_RATIOS = ["16:9", "9:16", "Auto"]
 
 
-class _Veo31Base(BaseKieVeoVideoNode):
-    """Shared INPUT_TYPES + build_veo_request for all Veo 3.1 tiers."""
+def _upload_first_optional(image_tensor: Any) -> str | None:
+    if image_tensor is None:
+        return None
+    return upload_image_tensor(image_tensor[0:1])
 
-    MODEL: ClassVar[str] = ""  # subclasses set this
+
+class _Veo31Base(BaseKieVeoVideoNode):
+    MODEL: ClassVar[str] = ""
 
     @classmethod
     def INPUT_TYPES(cls) -> dict[str, Any]:
@@ -48,14 +33,11 @@ class _Veo31Base(BaseKieVeoVideoNode):
                 "aspect_ratio": (_ASPECT_RATIOS, {"default": "16:9"}),
             },
             "optional": {
-                "image_url": ("STRING", {
-                    "default": "",
-                    "tooltip": "Optional first-frame image URL for image-to-video.",
+                "start_image": ("IMAGE", {
+                    "tooltip": "Optional first-frame image (image-to-video mode).",
                 }),
-                "last_frame_url": ("STRING", {
-                    "default": "",
-                    "tooltip": "Optional last-frame URL. If set with image_url, "
-                               "uses FIRST_AND_LAST_FRAMES_2_VIDEO mode.",
+                "end_image": ("IMAGE", {
+                    "tooltip": "Optional last-frame image. With start_image: FIRST_AND_LAST_FRAMES mode.",
                 }),
                 "enable_translation": ("BOOLEAN", {"default": True}),
                 "watermark": ("STRING", {"default": ""}),
@@ -64,20 +46,15 @@ class _Veo31Base(BaseKieVeoVideoNode):
         }
 
     def build_veo_request(self, **kwargs: Any) -> dict[str, Any]:
-        prompt: str = kwargs["prompt"]
-        resolution: str = kwargs["resolution"]
-        aspect_ratio: str = kwargs["aspect_ratio"]
-
-        image_url = (kwargs.get("image_url") or "").strip()
-        last_frame_url = (kwargs.get("last_frame_url") or "").strip()
+        start_url = _upload_first_optional(kwargs.get("start_image"))
+        end_url = _upload_first_optional(kwargs.get("end_image"))
 
         image_urls: list[str] | None = None
-        generation_type: str
-        if image_url and last_frame_url:
-            image_urls = [image_url, last_frame_url]
+        if start_url and end_url:
+            image_urls = [start_url, end_url]
             generation_type = "FIRST_AND_LAST_FRAMES_2_VIDEO"
-        elif image_url:
-            image_urls = [image_url]
+        elif start_url:
+            image_urls = [start_url]
             generation_type = "FIRST_AND_LAST_FRAMES_2_VIDEO"
         else:
             generation_type = "TEXT_2_VIDEO"
@@ -87,10 +64,10 @@ class _Veo31Base(BaseKieVeoVideoNode):
         seeds = seed if seed > 0 else None
 
         return {
-            "prompt": prompt,
+            "prompt": kwargs["prompt"],
             "image_urls": image_urls,
-            "aspect_ratio": aspect_ratio,
-            "resolution": resolution,
+            "aspect_ratio": kwargs["aspect_ratio"],
+            "resolution": kwargs["resolution"],
             "generation_type": generation_type,
             "enable_translation": bool(kwargs.get("enable_translation", True)),
             "watermark": watermark,
@@ -99,21 +76,16 @@ class _Veo31Base(BaseKieVeoVideoNode):
 
 
 class Veo31Lite(_Veo31Base):
-    """Veo 3.1 Lite — cheapest tier (~$0.15/8s 720p)."""
     MODEL = "veo3_lite"
 
 
 class Veo31Fast(_Veo31Base):
-    """Veo 3.1 Fast — balanced quality/cost (~$0.30/8s 720p)."""
     MODEL = "veo3_fast"
 
 
 class Veo31Quality(_Veo31Base):
-    """Veo 3.1 Quality — flagship tier (~$1.25/8s 720p)."""
     MODEL = "veo3"
 
-
-# ----------------------------------------------------------------- Registration
 
 NODE_CLASS_MAPPINGS: dict[str, type] = {
     "GenesisKieVeo31Lite": Veo31Lite,
@@ -122,7 +94,7 @@ NODE_CLASS_MAPPINGS: dict[str, type] = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS: dict[str, str] = {
-    "GenesisKieVeo31Lite": "Kie — Veo 3.1 Lite",
-    "GenesisKieVeo31Fast": "Kie — Veo 3.1 Fast",
-    "GenesisKieVeo31Quality": "Kie — Veo 3.1 Quality",
+    "GenesisKieVeo31Lite": "Veo 3.1 Lite",
+    "GenesisKieVeo31Fast": "Veo 3.1 Fast",
+    "GenesisKieVeo31Quality": "Veo 3.1 Quality",
 }

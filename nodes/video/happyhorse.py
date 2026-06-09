@@ -1,57 +1,37 @@
-"""HappyHorse 1.0 video generation nodes (complete family).
-
-HappyHorse-1.0 by Alibaba ATH — ranked #1 on Artificial Analysis Text-to-Video
-leaderboard in April 2026. Features joint audio-video generation in a single
-forward pass (15B-param unified self-attention Transformer).
-
-Covers all 4 HappyHorse endpoints in Kie.ai:
-
-- HappyHorse Text-to-Video        (happyhorse/text-to-video)
-- HappyHorse Image-to-Video       (happyhorse/image-to-video)
-- HappyHorse Reference-to-Video   (happyhorse/reference-to-video)  — 1-9 ref images
-- HappyHorse Video Edit           (happyhorse/video-edit)          — V2V editing
-
-All use the Market endpoint /api/v1/jobs/createTask.
-
-Parameter schemas inferred from:
-- Kie.ai's HappyHorse product page (kie.ai/happyhorse-1-0)
-- Runware HappyHorse-1.0 docs (mirrors the same model)
-- APIXO HappyHorse API docs (mirrors the same model)
-
-Common parameters across modes:
-- prompt (required) — max 5000 non-Chinese / 2500 Chinese chars
-- resolution: "720P" | "1080P" (default 1080P)
-- duration: 3-15 seconds (default 5)  [text/image/reference-to-video only]
-- aspect_ratio: "16:9" (default) | "9:16" | "1:1" | "4:3" | "3:4"
-                [text-to-video + reference-to-video only; I2V follows uploaded
-                 first frame; Edit follows input video]
-- seed: 0-2147483647
-- audio_setting: "auto" | "origin"  [video-edit only]
-
-NOTE: Param naming follows the snake_case Kie convention (resolution, not Resolution).
-The 720P/1080P enum values are UPPERCASE per docs.
-"""
+"""HappyHorse 1.0 video generation nodes (via GenesisLab proxy / Kie.ai)."""
 
 from __future__ import annotations
 
 from typing import Any, ClassVar
 
 from ..base import BaseKieMarketVideoNode
+from ...client.upload import upload_image_tensor, upload_video_frames
 
 
-_HAPPYHORSE_RATIOS = ["16:9", "9:16", "1:1", "4:3", "3:4"]
-_HAPPYHORSE_RESOLUTIONS = ["720P", "1080P"]
+_RATIOS = ["16:9", "9:16", "1:1", "4:3", "3:4"]
+_RESOLUTIONS = ["720P", "1080P"]
 
 
-# ============================================================ Text-to-Video
+def _upload_first(image_tensor: Any) -> str:
+    if image_tensor is None or not hasattr(image_tensor, "shape"):
+        raise ValueError("image tensor required")
+    return upload_image_tensor(image_tensor[0:1])
+
+
+def _upload_batch(image_tensor: Any) -> list[str]:
+    if image_tensor is None or not hasattr(image_tensor, "shape"):
+        raise ValueError("image tensor required")
+    n = image_tensor.shape[0] if len(image_tensor.shape) >= 4 else 1
+    return [upload_image_tensor(image_tensor[i:i + 1]) for i in range(n)]
+
+
+def _upload_batch_optional(image_tensor: Any) -> list[str]:
+    if image_tensor is None:
+        return []
+    return _upload_batch(image_tensor)
+
 
 class HappyHorseT2V(BaseKieMarketVideoNode):
-    """HappyHorse 1.0 text-to-video.
-
-    Generate a video purely from a text description. Native audio generation
-    is supported (joint audio-video model).
-    """
-
     MODEL = "happyhorse/text-to-video"
     POLL_INTERVAL_SECONDS = 5.0
     TIMEOUT_SECONDS = 900.0
@@ -62,13 +42,11 @@ class HappyHorseT2V(BaseKieMarketVideoNode):
             "required": {
                 "prompt": ("STRING", {
                     "multiline": True,
-                    "default": "A silver horse runs through a rain-soaked neon alley, cinematic camera move.",
+                    "default": "A silver horse runs through a rain-soaked neon alley.",
                 }),
-                "resolution": (_HAPPYHORSE_RESOLUTIONS, {"default": "1080P"}),
-                "aspect_ratio": (_HAPPYHORSE_RATIOS, {"default": "16:9"}),
-                "duration": ("INT", {
-                    "default": 5, "min": 3, "max": 15, "step": 1,
-                }),
+                "resolution": (_RESOLUTIONS, {"default": "1080P"}),
+                "aspect_ratio": (_RATIOS, {"default": "16:9"}),
+                "duration": ("INT", {"default": 5, "min": 3, "max": 15, "step": 1}),
             },
             "optional": {
                 "seed": ("INT", {"default": 0, "min": 0, "max": 2**31 - 1}),
@@ -88,15 +66,7 @@ class HappyHorseT2V(BaseKieMarketVideoNode):
         return body
 
 
-# ============================================================ Image-to-Video
-
 class HappyHorseI2V(BaseKieMarketVideoNode):
-    """HappyHorse 1.0 image-to-video.
-
-    Animate a static image into a short video. Dimensions follow the
-    uploaded first frame; only resolution tier is configurable.
-    """
-
     MODEL = "happyhorse/image-to-video"
     POLL_INTERVAL_SECONDS = 5.0
     TIMEOUT_SECONDS = 900.0
@@ -105,18 +75,10 @@ class HappyHorseI2V(BaseKieMarketVideoNode):
     def INPUT_TYPES(cls) -> dict[str, Any]:
         return {
             "required": {
-                "image_url": ("STRING", {
-                    "default": "",
-                    "tooltip": "First-frame image URL (required, max 10MB).",
-                }),
-                "prompt": ("STRING", {
-                    "multiline": True,
-                    "default": "Cinematic motion, subtle camera move.",
-                }),
-                "resolution": (_HAPPYHORSE_RESOLUTIONS, {"default": "1080P"}),
-                "duration": ("INT", {
-                    "default": 5, "min": 3, "max": 15, "step": 1,
-                }),
+                "image": ("IMAGE", {"tooltip": "First-frame image."}),
+                "prompt": ("STRING", {"multiline": True, "default": "Cinematic motion."}),
+                "resolution": (_RESOLUTIONS, {"default": "1080P"}),
+                "duration": ("INT", {"default": 5, "min": 3, "max": 15, "step": 1}),
             },
             "optional": {
                 "seed": ("INT", {"default": 0, "min": 0, "max": 2**31 - 1}),
@@ -124,12 +86,9 @@ class HappyHorseI2V(BaseKieMarketVideoNode):
         }
 
     def build_input(self, **kwargs: Any) -> dict[str, Any]:
-        img = (kwargs.get("image_url") or "").strip()
-        if not img:
-            raise ValueError("HappyHorse I2V requires image_url.")
         body: dict[str, Any] = {
             "prompt": kwargs["prompt"],
-            "image_url": img,
+            "image_url": _upload_first(kwargs.get("image")),
             "resolution": kwargs["resolution"],
             "duration": int(kwargs["duration"]),
         }
@@ -139,18 +98,7 @@ class HappyHorseI2V(BaseKieMarketVideoNode):
         return body
 
 
-# ============================================================ Reference-to-Video
-
 class HappyHorseR2V(BaseKieMarketVideoNode):
-    """HappyHorse 1.0 reference-to-video.
-
-    Generate a video guided by 1-9 reference images. Per docs:
-    - Use ``character1``, ``character2``, ... in the prompt to refer to
-      the corresponding images (order matches the array).
-    - Min resolution per image: short side >= 400px
-    - 720p+ clear images are recommended; avoid blurry / compressed sources.
-    """
-
     MODEL = "happyhorse/reference-to-video"
     POLL_INTERVAL_SECONDS = 5.0
     TIMEOUT_SECONDS = 900.0
@@ -159,19 +107,16 @@ class HappyHorseR2V(BaseKieMarketVideoNode):
     def INPUT_TYPES(cls) -> dict[str, Any]:
         return {
             "required": {
-                "image_urls": ("STRING", {
-                    "default": "",
-                    "tooltip": "Comma-separated 1-9 reference image URLs. Use 'character1', 'character2' in prompt to reference by order.",
+                "images": ("IMAGE", {
+                    "tooltip": "Reference image(s). Batch for multi-ref (1-9). Use 'character1','character2' in prompt.",
                 }),
                 "prompt": ("STRING", {
                     "multiline": True,
                     "default": "character1 walks toward the camera in a cinematic outdoor scene.",
                 }),
-                "resolution": (_HAPPYHORSE_RESOLUTIONS, {"default": "1080P"}),
-                "aspect_ratio": (_HAPPYHORSE_RATIOS, {"default": "16:9"}),
-                "duration": ("INT", {
-                    "default": 5, "min": 3, "max": 15, "step": 1,
-                }),
+                "resolution": (_RESOLUTIONS, {"default": "1080P"}),
+                "aspect_ratio": (_RATIOS, {"default": "16:9"}),
+                "duration": ("INT", {"default": 5, "min": 3, "max": 15, "step": 1}),
             },
             "optional": {
                 "seed": ("INT", {"default": 0, "min": 0, "max": 2**31 - 1}),
@@ -179,15 +124,15 @@ class HappyHorseR2V(BaseKieMarketVideoNode):
         }
 
     def build_input(self, **kwargs: Any) -> dict[str, Any]:
-        imgs = self._csv((kwargs.get("image_urls") or "").strip())
-        if not imgs:
+        urls = _upload_batch(kwargs.get("images"))
+        if not urls:
             raise ValueError("HappyHorse R2V requires at least one reference image.")
-        if len(imgs) > 9:
-            raise ValueError(f"HappyHorse R2V: max 9 reference images, got {len(imgs)}.")
+        if len(urls) > 9:
+            raise ValueError(f"HappyHorse R2V: max 9 references, got {len(urls)}.")
 
         body: dict[str, Any] = {
             "prompt": kwargs["prompt"],
-            "image_urls": imgs,
+            "image_urls": urls,
             "resolution": kwargs["resolution"],
             "aspect_ratio": kwargs["aspect_ratio"],
             "duration": int(kwargs["duration"]),
@@ -197,26 +142,9 @@ class HappyHorseR2V(BaseKieMarketVideoNode):
             body["seed"] = seed
         return body
 
-    @staticmethod
-    def _csv(value: str) -> list[str]:
-        if not value:
-            return []
-        return [s.strip() for s in value.split(",") if s.strip()]
-
-
-# ============================================================ Video Edit
 
 class HappyHorseEdit(BaseKieMarketVideoNode):
-    """HappyHorse 1.0 video edit (V2V).
-
-    Refine, adjust, or extend existing video content via prompt. Per docs:
-    - video_url is required (source video, max 10MB)
-    - Up to 5 optional reference images (each 300px+ per side; AR 1:2.5–2.5:1)
-    - Audio handling: ``audio_setting`` = ``"auto"`` (model decides) or
-      ``"origin"`` (keep source audio when supported)
-    - Output dimensions inherited from input video; only resolution tier
-      is selectable
-    """
+    """HappyHorse 1.0 V2V edit. Source video (IMAGE batch) + optional reference images."""
 
     MODEL = "happyhorse/video-edit"
     POLL_INTERVAL_SECONDS = 5.0
@@ -226,40 +154,37 @@ class HappyHorseEdit(BaseKieMarketVideoNode):
     def INPUT_TYPES(cls) -> dict[str, Any]:
         return {
             "required": {
-                "video_url": ("STRING", {
-                    "default": "",
-                    "tooltip": "Source video URL (required, max 10MB).",
-                }),
+                "video": ("IMAGE", {"tooltip": "Source video as IMAGE batch (N frames)."}),
                 "prompt": ("STRING", {
                     "multiline": True,
                     "default": "Apply cinematic color grading and a slow camera push-in.",
                 }),
-                "resolution": (_HAPPYHORSE_RESOLUTIONS, {"default": "1080P"}),
-                "audio_setting": (["auto", "origin"], {
-                    "default": "auto",
-                    "tooltip": "auto = model decides; origin = keep source audio.",
-                }),
+                "resolution": (_RESOLUTIONS, {"default": "1080P"}),
+                "audio_setting": (["auto", "origin"], {"default": "auto"}),
+                "fps": ("INT", {"default": 24, "min": 8, "max": 60, "step": 1}),
             },
             "optional": {
-                "reference_image_urls": ("STRING", {
-                    "default": "",
-                    "tooltip": "Comma-separated optional reference images (0-5).",
+                "reference_images": ("IMAGE", {
+                    "tooltip": "Optional reference image(s). Batch for multi-ref (0-5).",
                 }),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 2**31 - 1}),
             },
         }
 
     def build_input(self, **kwargs: Any) -> dict[str, Any]:
-        v = (kwargs.get("video_url") or "").strip()
-        if not v:
-            raise ValueError("HappyHorse Edit requires video_url.")
-        refs = self._csv((kwargs.get("reference_image_urls") or "").strip())
+        video_tensor = kwargs.get("video")
+        if video_tensor is None:
+            raise ValueError("HappyHorse Edit requires video input (IMAGE batch).")
+        fps = int(kwargs.get("fps", 24))
+        video_url = upload_video_frames(video_tensor, fps=fps)
+
+        refs = _upload_batch_optional(kwargs.get("reference_images"))
         if len(refs) > 5:
-            raise ValueError(f"HappyHorse Edit: max 5 reference images, got {len(refs)}.")
+            raise ValueError(f"HappyHorse Edit: max 5 references, got {len(refs)}.")
 
         body: dict[str, Any] = {
             "prompt": kwargs["prompt"],
-            "video_url": v,
+            "video_url": video_url,
             "resolution": kwargs["resolution"],
             "audio_setting": kwargs.get("audio_setting", "auto"),
         }
@@ -270,14 +195,6 @@ class HappyHorseEdit(BaseKieMarketVideoNode):
             body["seed"] = seed
         return body
 
-    @staticmethod
-    def _csv(value: str) -> list[str]:
-        if not value:
-            return []
-        return [s.strip() for s in value.split(",") if s.strip()]
-
-
-# ----------------------------------------------------------------- Registration
 
 NODE_CLASS_MAPPINGS: dict[str, type] = {
     "GenesisKieHappyHorseT2V": HappyHorseT2V,
@@ -287,8 +204,8 @@ NODE_CLASS_MAPPINGS: dict[str, type] = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS: dict[str, str] = {
-    "GenesisKieHappyHorseT2V": "Kie — HappyHorse 1.0 (T2V)",
-    "GenesisKieHappyHorseI2V": "Kie — HappyHorse 1.0 (I2V)",
-    "GenesisKieHappyHorseR2V": "Kie — HappyHorse 1.0 Reference-to-Video",
-    "GenesisKieHappyHorseEdit": "Kie — HappyHorse 1.0 Video Edit",
+    "GenesisKieHappyHorseT2V": "HappyHorse 1.0 (T2V)",
+    "GenesisKieHappyHorseI2V": "HappyHorse 1.0 (I2V)",
+    "GenesisKieHappyHorseR2V": "HappyHorse 1.0 Reference-to-Video",
+    "GenesisKieHappyHorseEdit": "HappyHorse 1.0 Video Edit",
 }

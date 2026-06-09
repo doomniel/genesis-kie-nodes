@@ -78,5 +78,5 @@ NODE_CLASS_MAPPINGS: dict[str, type] = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS: dict[str, str] = {
-    "GenesisKieGPTCodex": "Kie — GPT Codex (coding family)",
+    "GenesisKieGPTCodex": "GPT Codex (coding family)",
 }

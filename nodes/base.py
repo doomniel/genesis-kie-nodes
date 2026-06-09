@@ -41,10 +41,10 @@ log = logging.getLogger("genesis_kie")
 
 
 # Category strings shown in the ComfyUI menu.
-CATEGORY_VIDEO = "GenesisKie/Video"
-CATEGORY_IMAGE = "GenesisKie/Image"
-CATEGORY_MUSIC = "GenesisKie/Music"
-CATEGORY_LLM = "GenesisKie/LLM"
+CATEGORY_VIDEO = "GenesisLab/Video"
+CATEGORY_IMAGE = "GenesisLab/Image"
+CATEGORY_MUSIC = "GenesisLab/Audio"
+CATEGORY_LLM = "GenesisLab/LLM"
 
 
 # ----------------------------------------------------------------- common base
@@ -849,9 +849,8 @@ class BaseKieChatNode(BaseKieNode):
                     "default": "",
                     "tooltip": "Optional system message (sets persona/context).",
                 }),
-                "image_url": ("STRING", {
-                    "default": "",
-                    "tooltip": "Optional image URL for multimodal models.",
+                "image": ("IMAGE", {
+                    "tooltip": "Optional image (IMAGE tensor) for multimodal models.",
                 }),
                 "max_tokens": ("INT", {
                     "default": 2048, "min": 16, "max": 32768, "step": 16,
@@ -877,6 +876,15 @@ class BaseKieChatNode(BaseKieNode):
             raise KieError(f"{type(self).__name__} did not declare ENDPOINT.")
         if not self.MODEL_ID:
             raise KieError(f"{type(self).__name__} did not declare MODEL_ID.")
+
+        # Convert optional IMAGE tensor → public URL before delegating
+        # to build_body. Subclasses still consume kwargs["image_url"] (string).
+        image_tensor = kwargs.pop("image", None)
+        if image_tensor is not None and hasattr(image_tensor, "shape"):
+            from ..client.upload import upload_image_tensor
+            kwargs["image_url"] = upload_image_tensor(image_tensor[0:1])
+        else:
+            kwargs.setdefault("image_url", "")
 
         body = self.build_body(**kwargs)
 

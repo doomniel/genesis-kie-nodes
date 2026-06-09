@@ -1,9 +1,17 @@
-"""API key management for Kie.ai.
+"""API key + auth management for Kie.ai with GenesisLab proxy support.
 
-The key is read from the environment variable ``KIE_API_KEY``. When running
-inside GenesisLab, this variable is injected automatically by the proxy at
-container startup. For standalone use, set it manually before launching
-ComfyUI.
+This module handles two operating modes:
+
+* **Direct mode** (default): ``KIE_BASE_URL`` is unset or points to
+  ``api.kie.ai``. The Authorization header carries the real ``KIE_API_KEY``.
+
+* **Proxy mode**: ``KIE_BASE_URL`` points to the GenesisLab proxy (e.g.
+  ``https://app.genesislab.top/api/proxy/kie``). The Authorization header
+  carries a synthetic token ``genesis-{GENESIS_USER_ID}`` which the proxy
+  resolves to the real key (master or BYOK) and uses for wallet billing.
+
+Mode is auto-detected from the base URL substring ``genesislab``. To force
+proxy mode for testing, set ``GENESIS_PROXY_MODE=1``.
 """
 
 from __future__ import annotations
@@ -18,9 +26,9 @@ _DOTENV_FILENAMES = (".env", ".env.local")
 
 
 def _load_dotenv_into_env() -> None:
-    """Best-effort load of ``.env`` and ``.env.local`` from the current working
-    directory and walk up to 4 levels. Does NOT overwrite values that are
-    already present in ``os.environ``.
+    """Best-effort load of ``.env`` and ``.env.local`` from the current
+    working directory and walk up to 4 levels. Does NOT overwrite values
+    that are already present in ``os.environ``.
 
     We avoid pulling in python-dotenv as a dependency to keep this package
     minimal.
@@ -50,8 +58,8 @@ def _load_dotenv_into_env() -> None:
 
 
 def get_api_key() -> str:
-    """Return the configured Kie API key, raising :class:`KieAuthError` if
-    none is available.
+    """Return the configured raw Kie API key, raising :class:`KieAuthError`
+    if none is available. Used in direct mode.
     """
     key = os.environ.get(_ENV_KEY)
     if not key:
@@ -72,6 +80,54 @@ def get_base_url() -> str:
 
     Defaults to ``https://api.kie.ai`` but can be overridden via the
     ``KIE_BASE_URL`` environment variable (useful for routing through the
-    GenesisLab proxy at e.g. ``https://kie.genesislab.top``).
+    GenesisLab proxy at e.g. ``https://app.genesislab.top/api/proxy/kie``).
     """
     return os.environ.get("KIE_BASE_URL", "https://api.kie.ai").rstrip("/")
+
+
+def get_user_id() -> str | None:
+    """Return the GenesisLab user id from the ``GENESIS_USER_ID`` env var.
+
+    Required when running in proxy mode. The proxy uses this id to
+    identify the wallet to charge and to authorize the call.
+    """
+    user_id = os.environ.get("GENESIS_USER_ID")
+    if user_id:
+        user_id = user_id.strip()
+    return user_id or None
+
+
+def is_proxied() -> bool:
+    """Return True when ``KIE_BASE_URL`` points to the GenesisLab proxy.
+
+    Detection is heuristic: any base URL containing 'genesislab' is treated
+    as the proxy. This avoids forcing users to set a separate flag. To
+    force proxy mode explicitly (e.g. for local testing against a tunnel),
+    set ``GENESIS_PROXY_MODE=1``.
+    """
+    if os.environ.get("GENESIS_PROXY_MODE", "").strip() == "1":
+        return True
+    return "genesislab" in get_base_url().lower()
+
+
+def get_auth_token() -> str:
+    """Return the bearer token to use in the Authorization header.
+
+    In proxy mode: returns ``genesis-{user_id}`` (the GenesisLab proxy
+    resolves this to the real master/BYOK key and performs wallet billing).
+
+    In direct mode: returns the raw ``KIE_API_KEY``.
+
+    Raises :class:`KieAuthError` if the required configuration is missing
+    for the detected mode.
+    """
+    if is_proxied():
+        user_id = get_user_id()
+        if not user_id:
+            raise KieAuthError(
+                "KIE_BASE_URL points to the GenesisLab proxy but "
+                "GENESIS_USER_ID is not set. Configure it in your "
+                "comfyui.service Environment= or in .env."
+            )
+        return f"genesis-{user_id}"
+    return get_api_key()

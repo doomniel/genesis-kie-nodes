@@ -1,23 +1,4 @@
-"""Runway Gen-4 Turbo + Aleph video generation nodes (via Kie.ai).
-
-Covers the 3 Runway endpoints in Kie.ai:
-
-- Runway Gen-4 Turbo (text-to-video / image-to-video)
-- Runway Gen-4 Turbo Video Extend
-- Runway Aleph (video-to-video editing)
-
-**This module uses Kie.ai's DEDICATED Runway endpoints**, not the Market
-`createTask` endpoint. The key differences:
-
-- POST /api/v1/runway/generate  (camelCase body, no ``input`` wrapper)
-- POST /api/v1/runway/extend
-- POST /api/v1/aleph/generate
-- GET  /api/v1/runway/record-detail?taskId=X   (polling)
-
-Response shape: ``data.videoInfo.videoUrl`` (not ``data.resultJson``).
-
-The KieClient exposes ``run_runway(path, body)`` for this pattern.
-"""
+"""Runway Gen-4 Turbo + Aleph video nodes (dedicated endpoints, via GenesisLab proxy)."""
 
 from __future__ import annotations
 
@@ -26,32 +7,30 @@ from typing import Any, ClassVar
 
 from ..base import BaseKieNode, CATEGORY_VIDEO
 from ...client import KieClient, KieError, download_to_output
+from ...client.upload import upload_image_tensor, upload_video_frames
 
 log = logging.getLogger("genesis_kie")
 
 
-def _runway_first_url(data: dict[str, Any]) -> str | None:
-    """Extract the videoUrl from a Runway record-detail response.
+def _upload_first_optional(image_tensor: Any) -> str | None:
+    if image_tensor is None:
+        return None
+    return upload_image_tensor(image_tensor[0:1])
 
-    Shape: ``data.videoInfo.videoUrl``.
-    """
+
+def _runway_first_url(data: dict[str, Any]) -> str | None:
     video_info = data.get("videoInfo") or {}
     if isinstance(video_info, dict):
         url = video_info.get("videoUrl")
         if isinstance(url, str) and url:
             return url
-    # Fallback: some early implementations may put videoUrl at top level.
     direct = data.get("videoUrl")
     if isinstance(direct, str) and direct:
         return direct
     return None
 
 
-# ============================================================ Base
-
 class _BaseRunwayNode(BaseKieNode):
-    """Common scaffolding for Runway dedicated-API video nodes."""
-
     CATEGORY = CATEGORY_VIDEO
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("video_path",)
@@ -60,11 +39,9 @@ class _BaseRunwayNode(BaseKieNode):
     POLL_INTERVAL_SECONDS = 6.0
     TIMEOUT_SECONDS = 1200.0
 
-    # Subclasses set this.
     RUNWAY_PATH: ClassVar[str] = ""
 
     def build_runway_body(self, **kwargs: Any) -> dict[str, Any]:
-        """Build the (camelCase, no ``input`` wrapper) Runway request body."""
         raise NotImplementedError
 
     def run(self, **kwargs: Any) -> tuple[str, ...]:
@@ -94,26 +71,15 @@ class _BaseRunwayNode(BaseKieNode):
         url = _runway_first_url(data)
         if not url:
             raise KieError(
-                "Runway returned no videoUrl. "
-                f"data keys: {list(data.keys())}, "
+                f"Runway returned no videoUrl. data keys: {list(data.keys())}, "
                 f"videoInfo: {data.get('videoInfo')}"
             )
         path = download_to_output(url, prefix="kie_runway", fallback_ext="mp4")
         return (path,)
 
 
-# ============================================================ Generate
-
 class RunwayGenerate(_BaseRunwayNode):
-    """Runway Gen-4 Turbo — text-to-video or image-to-video.
-
-    Per docs:
-    - Required: prompt
-    - Optional: imageUrl (turns t2v into i2v), duration ("5"/"10"),
-      quality ("720p"/"1080p"), aspectRatio ("16:9"/"9:16"), waterMark
-    - Note: imageUrl supports JPG/PNG, max 10MB
-    - Quality "1080p" only compatible with duration "5"
-    """
+    """Runway Gen-4 Turbo — T2V or I2V (when image connected)."""
 
     RUNWAY_PATH = "/api/v1/runway/generate"
 
@@ -126,21 +92,12 @@ class RunwayGenerate(_BaseRunwayNode):
                     "default": "A fluffy orange cat dancing in a colorful room with disco lights.",
                 }),
                 "duration": (["5", "10"], {"default": "5"}),
-                "quality": (["720p", "1080p"], {
-                    "default": "720p",
-                    "tooltip": "1080p only works with duration=5 per docs.",
-                }),
+                "quality": (["720p", "1080p"], {"default": "720p"}),
                 "aspectRatio": (["16:9", "9:16"], {"default": "16:9"}),
             },
             "optional": {
-                "imageUrl": ("STRING", {
-                    "default": "",
-                    "tooltip": "Optional reference image URL. When set, becomes image-to-video.",
-                }),
-                "waterMark": ("STRING", {
-                    "default": "",
-                    "tooltip": "Optional watermark text overlay.",
-                }),
+                "image": ("IMAGE", {"tooltip": "Optional reference image (turns T2V into I2V)."}),
+                "waterMark": ("STRING", {"default": ""}),
             },
         }
 
@@ -148,9 +105,7 @@ class RunwayGenerate(_BaseRunwayNode):
         duration = str(kwargs["duration"])
         quality = kwargs["quality"]
         if quality == "1080p" and duration != "5":
-            raise ValueError(
-                "Runway: quality=1080p is only compatible with duration=5 (per docs)."
-            )
+            raise ValueError("Runway: quality=1080p only compatible with duration=5.")
 
         body: dict[str, Any] = {
             "prompt": kwargs["prompt"],
@@ -158,25 +113,17 @@ class RunwayGenerate(_BaseRunwayNode):
             "quality": quality,
             "aspectRatio": kwargs["aspectRatio"],
         }
-        img = (kwargs.get("imageUrl") or "").strip()
-        if img:
-            body["imageUrl"] = img
+        img_url = _upload_first_optional(kwargs.get("image"))
+        if img_url:
+            body["imageUrl"] = img_url
         wm = (kwargs.get("waterMark") or "").strip()
         if wm:
             body["waterMark"] = wm
         return body
 
 
-# ============================================================ Extend
-
 class RunwayExtend(_BaseRunwayNode):
-    """Runway Gen-4 Turbo — video extension.
-
-    Extends a previously-generated Runway video. Per docs:
-    - Required: taskId (from a previous Runway generation)
-    - Optional: prompt (describes how to extend), quality, waterMark
-    - Note: Videos generated at 1080p CANNOT be extended (per docs).
-    """
+    """Runway Extend — extends a previously-generated Runway 720p video by task_id."""
 
     RUNWAY_PATH = "/api/v1/runway/extend"
 
@@ -184,10 +131,7 @@ class RunwayExtend(_BaseRunwayNode):
     def INPUT_TYPES(cls) -> dict[str, Any]:
         return {
             "required": {
-                "taskId": ("STRING", {
-                    "default": "",
-                    "tooltip": "Task ID from a prior Runway generate call (must be 720p).",
-                }),
+                "taskId": ("STRING", {"default": "", "tooltip": "Prior Runway task_id (720p only)."}),
                 "prompt": ("STRING", {
                     "multiline": True,
                     "default": "The scene continues with more energy and motion.",
@@ -214,22 +158,11 @@ class RunwayExtend(_BaseRunwayNode):
         return body
 
 
-# ============================================================ Aleph
-
 class RunwayAleph(_BaseRunwayNode):
-    """Runway Aleph — text-guided video-to-video transformation.
-
-    Per docs:
-    - Required: prompt + videoUrl (the input video to transform)
-    - Optional: waterMark, uploadCn (bool, defaults to false)
-    - Outputs are capped at 5 seconds (input >5s only processes first 5s)
-
-    Aleph supports: object addition/removal, relighting, style changes,
-    new camera angles — while preserving motion and timing of source clip.
-    """
+    """Runway Aleph — text-guided V2V transformation. Input video as IMAGE batch."""
 
     RUNWAY_PATH = "/api/v1/aleph/generate"
-    TIMEOUT_SECONDS = 1500.0  # Aleph can be slower than standard generate.
+    TIMEOUT_SECONDS = 1500.0
 
     @classmethod
     def INPUT_TYPES(cls) -> dict[str, Any]:
@@ -239,27 +172,25 @@ class RunwayAleph(_BaseRunwayNode):
                     "multiline": True,
                     "default": "A majestic eagle soaring through mountain clouds at sunset.",
                 }),
-                "videoUrl": ("STRING", {
-                    "default": "",
-                    "tooltip": "Input video URL to transform (max 5s processed).",
-                }),
+                "video": ("IMAGE", {"tooltip": "Source video as IMAGE batch (N frames)."}),
+                "fps": ("INT", {"default": 24, "min": 8, "max": 60, "step": 1}),
             },
             "optional": {
                 "waterMark": ("STRING", {"default": ""}),
-                "uploadCn": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "True = use China-region upload (better for CN access).",
-                }),
+                "uploadCn": ("BOOLEAN", {"default": False}),
             },
         }
 
     def build_runway_body(self, **kwargs: Any) -> dict[str, Any]:
-        v = (kwargs.get("videoUrl") or "").strip()
-        if not v:
-            raise ValueError("Runway Aleph requires videoUrl.")
+        video_tensor = kwargs.get("video")
+        if video_tensor is None:
+            raise ValueError("Runway Aleph requires video input (IMAGE batch).")
+        fps = int(kwargs.get("fps", 24))
+        video_url = upload_video_frames(video_tensor, fps=fps)
+
         body: dict[str, Any] = {
             "prompt": kwargs["prompt"],
-            "videoUrl": v,
+            "videoUrl": video_url,
             "uploadCn": bool(kwargs.get("uploadCn", False)),
         }
         wm = (kwargs.get("waterMark") or "").strip()
@@ -268,8 +199,6 @@ class RunwayAleph(_BaseRunwayNode):
         return body
 
 
-# ----------------------------------------------------------------- Registration
-
 NODE_CLASS_MAPPINGS: dict[str, type] = {
     "GenesisKieRunwayGenerate": RunwayGenerate,
     "GenesisKieRunwayExtend": RunwayExtend,
@@ -277,7 +206,7 @@ NODE_CLASS_MAPPINGS: dict[str, type] = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS: dict[str, str] = {
-    "GenesisKieRunwayGenerate": "Kie — Runway Gen-4 Turbo",
-    "GenesisKieRunwayExtend": "Kie — Runway Extend",
-    "GenesisKieRunwayAleph": "Kie — Runway Aleph (V2V)",
+    "GenesisKieRunwayGenerate": "Runway Gen-4 Turbo",
+    "GenesisKieRunwayExtend": "Runway Extend",
+    "GenesisKieRunwayAleph": "Runway Aleph (V2V)",
 }

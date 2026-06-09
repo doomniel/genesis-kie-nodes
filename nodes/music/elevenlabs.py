@@ -1,18 +1,14 @@
-"""ElevenLabs audio nodes (via Kie.ai's Market endpoint).
+"""ElevenLabs audio nodes (via GenesisLab proxy / Kie.ai Market endpoint).
 
-Covers all 4 ElevenLabs endpoints in Kie.ai:
+Covers all 4 ElevenLabs endpoints:
 
 - elevenlabs/audio-isolation                  (stem extraction from full mix)
-- elevenlabs/text-to-dialogue-v3              (TTS multi-speaker dialogue)
+- elevenlabs/text-to-dialogue-v3              (multi-speaker dialogue TTS)
 - elevenlabs/text-to-speech-multilingual-v2   (TTS, 29+ languages, premium)
-- elevenlabs/text-to-speech-turbo-2-5         (TTS, faster + cheaper, 32 langs)
+- elevenlabs/text-to-speech-turbo-2-5         (TTS, faster + cheaper)
 
-All use the generic Market pattern: POST /api/v1/jobs/createTask with
-``model`` + ``input`` body. Result audio URL lives in ``data._parsed_result.resultUrls``.
-
-ElevenLabs voices: each TTS model accepts a ``voice`` field. Common
-preset voices include "Rachel", "Antoni", "Bella", "Sam", "Adam".
-Custom voice IDs (sha-256 hash) also accepted.
+AudioIsolation accepts a native ComfyUI AUDIO input (dict with waveform
++ sample_rate). The 3 TTS nodes are text-only and don't need audio input.
 """
 
 from __future__ import annotations
@@ -20,6 +16,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..base import BaseKieMarketAudioNode
+from ...client.upload import upload_audio
 
 
 _EL_VOICE_PRESETS = [
@@ -33,9 +30,9 @@ _EL_OUTPUT_FORMATS = ["mp3_44100_128", "mp3_44100_192", "pcm_22050", "pcm_44100"
 class ElevenLabsAudioIsolation(BaseKieMarketAudioNode):
     """ElevenLabs Audio Isolation — extracts clean vocal stem from a mix.
 
-    Per kie.ai docs: removes background music/noise and isolates vocals
-    using ElevenLabs' proprietary stem-separation model. Single audio URL
-    input, single (vocals-only) audio output.
+    Accepts a native ComfyUI AUDIO input. The waveform is uploaded to
+    GenesisLab temp storage as WAV and the resulting URL is sent to
+    ElevenLabs' stem-separation model.
     """
 
     MODEL = "elevenlabs/audio-isolation"
@@ -46,18 +43,18 @@ class ElevenLabsAudioIsolation(BaseKieMarketAudioNode):
     def INPUT_TYPES(cls) -> dict[str, Any]:
         return {
             "required": {
-                "audio_url": ("STRING", {
-                    "default": "",
-                    "tooltip": "Source audio URL (mp3/wav/ogg).",
+                "audio": ("AUDIO", {
+                    "tooltip": "Source audio (mix). Will isolate vocals.",
                 }),
             },
         }
 
     def build_input(self, **kwargs: Any) -> dict[str, Any]:
-        audio = (kwargs.get("audio_url") or "").strip()
-        if not audio:
-            raise ValueError("ElevenLabs Audio Isolation requires audio_url.")
-        return {"audio_url": audio}
+        audio = kwargs.get("audio")
+        if audio is None:
+            raise ValueError("ElevenLabs Audio Isolation requires audio input.")
+        url = upload_audio(audio)
+        return {"audio_url": url}
 
 
 class _ElevenLabsTTSBase(BaseKieMarketAudioNode):
@@ -87,15 +84,12 @@ class _ElevenLabsTTSBase(BaseKieMarketAudioNode):
                 "output_format": (_EL_OUTPUT_FORMATS, {"default": "mp3_44100_128"}),
                 "stability": ("FLOAT", {
                     "default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "Voice stability (0=expressive, 1=monotone).",
                 }),
                 "similarity_boost": ("FLOAT", {
                     "default": 0.75, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "Voice similarity to reference (higher = more accurate).",
                 }),
                 "style": ("FLOAT", {
                     "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "Style exaggeration (v3+ models only).",
                 }),
             },
         }
@@ -127,32 +121,17 @@ class _ElevenLabsTTSBase(BaseKieMarketAudioNode):
 
 
 class ElevenLabsTTSMultilingualV2(_ElevenLabsTTSBase):
-    """ElevenLabs Multilingual v2 — 29+ languages, premium quality.
-
-    Use for: marketing voiceovers, audiobook narration, dubbing,
-    localized content where voice quality matters most.
-    """
+    """ElevenLabs Multilingual v2 — 29+ languages, premium quality."""
     MODEL = "elevenlabs/text-to-speech-multilingual-v2"
 
 
 class ElevenLabsTTSTurbo25(_ElevenLabsTTSBase):
-    """ElevenLabs Turbo 2.5 — faster + cheaper, 32 languages.
-
-    Use for: real-time TTS, AI agents, interactive applications
-    where speed > absolute fidelity.
-    """
+    """ElevenLabs Turbo 2.5 — faster + cheaper, 32 languages."""
     MODEL = "elevenlabs/text-to-speech-turbo-2-5"
 
 
 class ElevenLabsTextToDialogueV3(BaseKieMarketAudioNode):
-    """ElevenLabs Text-to-Dialogue v3 — multi-speaker conversational audio.
-
-    Generate realistic back-and-forth dialogue between multiple voices.
-    Input is structured text with speaker tags.
-
-    Per docs: input format is text with [Speaker1] / [Speaker2] markers
-    (or similar tagging) — the model parses speakers and assigns voices.
-    """
+    """ElevenLabs Text-to-Dialogue v3 — multi-speaker conversational audio."""
 
     MODEL = "elevenlabs/text-to-dialogue-v3"
     POLL_INTERVAL_SECONDS = 3.0
@@ -196,8 +175,6 @@ class ElevenLabsTextToDialogueV3(BaseKieMarketAudioNode):
         }
 
 
-# ----------------------------------------------------------------- Registration
-
 NODE_CLASS_MAPPINGS: dict[str, type] = {
     "GenesisKieElevenLabsAudioIsolation": ElevenLabsAudioIsolation,
     "GenesisKieElevenLabsTTSMultilingualV2": ElevenLabsTTSMultilingualV2,
@@ -206,8 +183,8 @@ NODE_CLASS_MAPPINGS: dict[str, type] = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS: dict[str, str] = {
-    "GenesisKieElevenLabsAudioIsolation": "Kie — ElevenLabs Audio Isolation",
-    "GenesisKieElevenLabsTTSMultilingualV2": "Kie — ElevenLabs TTS Multilingual v2",
-    "GenesisKieElevenLabsTTSTurbo25": "Kie — ElevenLabs TTS Turbo 2.5",
-    "GenesisKieElevenLabsTextToDialogueV3": "Kie — ElevenLabs Text-to-Dialogue v3",
+    "GenesisKieElevenLabsAudioIsolation": "ElevenLabs Audio Isolation",
+    "GenesisKieElevenLabsTTSMultilingualV2": "ElevenLabs TTS Multilingual v2",
+    "GenesisKieElevenLabsTTSTurbo25": "ElevenLabs TTS Turbo 2.5",
+    "GenesisKieElevenLabsTextToDialogueV3": "ElevenLabs Text-to-Dialogue v3",
 }

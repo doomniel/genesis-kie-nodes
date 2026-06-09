@@ -101,11 +101,11 @@ NODE_CLASS_MAPPINGS: dict[str, type] = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS: dict[str, str] = {
-    "GenesisKieClaudeOpus4_5": "Kie — Claude Opus 4.5",
-    "GenesisKieClaudeOpus4_6": "Kie — Claude Opus 4.6",
-    "GenesisKieClaudeOpus4_7": "Kie — Claude Opus 4.7",
-    "GenesisKieClaudeOpus4_8": "Kie — Claude Opus 4.8 (frontier)",
-    "GenesisKieClaudeSonnet4_5": "Kie — Claude Sonnet 4.5",
-    "GenesisKieClaudeSonnet4_6": "Kie — Claude Sonnet 4.6",
-    "GenesisKieClaudeHaiku4_5": "Kie — Claude Haiku 4.5 (fast)",
+    "GenesisKieClaudeOpus4_5": "Claude Opus 4.5",
+    "GenesisKieClaudeOpus4_6": "Claude Opus 4.6",
+    "GenesisKieClaudeOpus4_7": "Claude Opus 4.7",
+    "GenesisKieClaudeOpus4_8": "Claude Opus 4.8 (frontier)",
+    "GenesisKieClaudeSonnet4_5": "Claude Sonnet 4.5",
+    "GenesisKieClaudeSonnet4_6": "Claude Sonnet 4.6",
+    "GenesisKieClaudeHaiku4_5": "Claude Haiku 4.5 (fast)",
 }

@@ -119,7 +119,7 @@ from typing import Any
 
 import httpx
 
-from .auth import get_api_key, get_base_url
+from .auth import get_api_key, get_base_url, get_auth_token
 from .exceptions import (
     KieAuthError,
     KieError,
@@ -168,7 +168,7 @@ class KieClient:
         base_url: str | None = None,
         request_timeout: float = _DEFAULT_REQUEST_TIMEOUT_SECONDS,
     ) -> None:
-        self._api_key = api_key or get_api_key()
+        self._api_key = api_key or get_auth_token()
         self._base_url = (base_url or get_base_url()).rstrip("/")
         self._client = httpx.Client(
             timeout=httpx.Timeout(request_timeout),

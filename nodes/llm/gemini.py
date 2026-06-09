@@ -116,10 +116,10 @@ NODE_CLASS_MAPPINGS: dict[str, type] = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS: dict[str, str] = {
-    "GenesisKieGemini2_5Pro": "Kie — Gemini 2.5 Pro",
-    "GenesisKieGemini3Pro": "Kie — Gemini 3 Pro",
-    "GenesisKieGemini3_1Pro": "Kie — Gemini 3.1 Pro (frontier)",
-    "GenesisKieGemini2_5Flash": "Kie — Gemini 2.5 Flash",
-    "GenesisKieGemini3Flash": "Kie — Gemini 3 Flash",
-    "GenesisKieGemini3_5Flash": "Kie — Gemini 3.5 Flash (best value)",
+    "GenesisKieGemini2_5Pro": "Gemini 2.5 Pro",
+    "GenesisKieGemini3Pro": "Gemini 3 Pro",
+    "GenesisKieGemini3_1Pro": "Gemini 3.1 Pro (frontier)",
+    "GenesisKieGemini2_5Flash": "Gemini 2.5 Flash",
+    "GenesisKieGemini3Flash": "Gemini 3 Flash",
+    "GenesisKieGemini3_5Flash": "Gemini 3.5 Flash (best value)",
 }

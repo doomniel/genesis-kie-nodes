@@ -62,7 +62,7 @@ NODE_CLASS_MAPPINGS: dict[str, type] = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS: dict[str, str] = {
-    "GenesisKieGPT5_2": "Kie — GPT 5.2 (chat)",
-    "GenesisKieGPT5_4": "Kie — GPT 5.4 (reasoning)",
-    "GenesisKieGPT5_5": "Kie — GPT 5.5 (frontier)",
+    "GenesisKieGPT5_2": "GPT 5.2 (chat)",
+    "GenesisKieGPT5_4": "GPT 5.4 (reasoning)",
+    "GenesisKieGPT5_5": "GPT 5.5 (frontier)",
 }

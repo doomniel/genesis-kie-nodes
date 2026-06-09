@@ -47,3 +47,7 @@ tests_local/
 
 # Generated videos / images / audio
 output/
+
+# Backup files created during refactors
+*.bak
+*.bak.*
